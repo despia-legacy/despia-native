@@ -1,5 +1,15 @@
 # [Despia Native](https://despia.com)
 
+> ### Part of Despia Convert
+>
+> This repository supports **Despia Convert** and Despia V4 WebView applications. Despia Convert is the fastest way to turn an existing web application into an iOS or Android app while keeping the existing web codebase.
+>
+> This project is actively supported for Convert and WebView-based applications.
+>
+> For projects that require fully native UI and native rendering, use **DSX Native**, Despia's native-first platform (SwiftUI on iOS, Jetpack Compose on Android). Convert applications can migrate to DSX Native later if deeper native UI or performance is required. Despia does not charge a migration fee.
+>
+> Current documentation: [docs.despia.com](https://docs.despia.com)
+
 Add 50+ native iOS and Android capabilities to any web app (React, Vue, Angular, Svelte, Next.js, vanilla JS) through a single `despia()` function. Plus native offline support, a local SQLite database, and an on-device streaming CDN, solving 15 years of hybrid-app problems with modern runtime architecture.
 
 [![npm](https://img.shields.io/npm/v/despia-native)](https://www.npmjs.com/package/despia-native)
@@ -64,7 +74,7 @@ Despia is a hybrid app runtime built on the web platform. The web handles what i
 
 Works with any web codebase. Bring an existing app or start fresh with any framework, any build tool, any host. No framework lock-in, no proprietary hosting, nothing to migrate.
 
-Full native offline support. [`@despia/local`](https://www.npmjs.com/package/@despia/local) serves your web build from `http://localhost`, [`@despia/powersync`](https://www.npmjs.com/package/@despia/powersync) adds a native SQLite database that syncs with your backend, and the [Local CDN](https://setup.despia.com/local-cdn) streams cached media from device storage. File transfers stream between native storage and the web layer without loading into the JS heap.
+Full native offline support. [`@despia/local`](https://www.npmjs.com/package/@despia/local) serves your web build from `http://localhost`, and the [Local CDN](https://setup.despia.com/local-cdn) streams cached media from device storage. For on-device database options, see the [current Despia documentation](https://docs.despia.com). File transfers stream between native storage and the web layer without loading into the JS heap.
 
 Push, monetization, ads, and attribution are built in: OneSignal, RevenueCat, AdMob, AppsFlyer. Pre-wired into the runtime, configured from the Despia dashboard, called from web code. Builds, signing, and store submission run from the browser. No Xcode, no Android Studio.
 
