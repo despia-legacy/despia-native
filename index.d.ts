@@ -70,6 +70,8 @@ interface DespiaFunction {
    * @param command - The Despia protocol command
    * @param watch - Array of variable names to watch for in the response
    * @returns Promise that resolves with the watched variables
+   * Watched values may be null, [] or {}; validate response shape before using it.
+   * Missing undefined/"n/a" values retain the existing timeout behavior.
    * 
    * @example
    * ```typescript

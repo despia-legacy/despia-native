@@ -59,8 +59,6 @@
 
         const ready = (val) => {
             if (val === undefined || val === "n/a") return false;
-            if (Array.isArray(val) && val.length === 0) return false;
-            if (val && typeof val === 'object' && !Array.isArray(val) && Object.keys(val).length === 0) return false;
             return true;
         };
 
@@ -76,7 +74,7 @@
             const val = window[variableName];
 
             if (ready(val) && changed(val)) {
-                // Fresh, non-empty value arrived → resolve with it
+                // Fresh response arrived; empty collections and null are valid data.
                 callback(val);
                 return;
             }
@@ -128,8 +126,8 @@
                 const values = {};
                 const allSet = this.variables.every(name => {
                     const val = window[name];
-                    // Check for undefined, "n/a" string, or null values
-                    if (val === undefined || val === "n/a" || val === null) return false;
+                    // Null signals completed unavailability; only missing values wait.
+                    if (val === undefined || val === "n/a") return false;
                     values[name] = val;
                     return true;
                 });
@@ -188,16 +186,10 @@
   
     // Main despia function
     function despiaFunction(command, watch = []) {
-      // Queue command execution
+      // Clear stale responses and start watching before the native setter can reply.
+      const response = watch && watch.length > 0 ? observeVariables(watch) : null;
       queueCommand(command);
-      
-      // No variables to watch
-      if (!watch || watch.length === 0) {
-        return Promise.resolve();
-      }
-      
-      // Watch for variables (timeout handled internally)
-      return observeVariables(watch);
+      return response || Promise.resolve();
     }
   
     // Create proxy for window access

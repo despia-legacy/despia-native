@@ -183,7 +183,7 @@ despia(`revenuecat://purchase?external_id=${userId}&product=monthly_premium_ios`
 ```js
 window.onRevenueCatPurchase = async () => {
   const { restoredData } = await despia('getpurchasehistory://', ['restoredData']);
-  if (restoredData.some(p => p.isActive && p.entitlementId === 'premium')) unlockPremium();
+  if (Array.isArray(restoredData) && restoredData.some(p => p.isActive && p.entitlementId === 'premium')) unlockPremium();
 };
 ```
 
@@ -598,3 +598,7 @@ No dependencies, no initialization, no lifecycle to manage.
 ## Support
 
 [npm@despia.com](mailto:npm@despia.com)
+
+## Watched response values
+
+A watched native response can be `null`, an empty array (`[]`), or an empty object (`{}`). These values complete the request immediately. `null` can indicate unavailable data or failure; an empty collection can be a valid result, so check the response shape before treating it as success. Values that are `undefined` or `"n/a"` continue waiting until the existing timeout. See [release notes](CHANGELOG.md) for the observer changes in 1.0.0.
