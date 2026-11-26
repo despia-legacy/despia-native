@@ -97,6 +97,7 @@ module.exports = {
     "actions": {
       "app_version": {
         "kind": "request",
+        "alias": "appVersion",
         "legacy": {
           "scheme": "getappversion",
           "args": [],
@@ -118,6 +119,7 @@ module.exports = {
       },
       "store_location": {
         "kind": "request",
+        "alias": "storeLocation",
         "legacy": {
           "scheme": "getstorelocation",
           "args": [],

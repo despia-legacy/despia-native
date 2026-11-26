@@ -291,7 +291,7 @@ export type DespiaResult<F extends DespiaFeatureName, A extends DespiaActionName
 /** `despia.bridge`: the built-in actions of the bridge itself. */
 export interface DespiaBridgeActions {
   hello(): Promise<Hello>;
-  subscribe(args: { feature: FeatureId | '*'; events?: string[]; since?: Record<string, number> | 'all' }): Promise<{ subscribed: true }>;
+  subscribe(args: { feature: FeatureId | '*'; events?: string[]; since?: Record<string, number> }): Promise<{ subscribed: true }>;
   unsubscribe(args: { feature: FeatureId | '*'; events?: string[] }): Promise<Record<string, never>>;
   jobs(args?: { feature?: FeatureId; states?: JobState[] }): Promise<{ jobs: JobInfo[] }>;
   job(args: { jobId: string }): Promise<JobInfo>;

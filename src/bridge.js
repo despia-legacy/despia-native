@@ -61,13 +61,15 @@ function unwrap(reply) {
 function cleanHello(value) {
   if (!isObject(value) || !isObject(value.features)) return null;
   const hello = Object.assign({}, value);
-  delete hello.cap; // never part of anything the SDK hands out
+  delete hello.cap;
   return hello;
 }
 
 // One native call, guarded: gives up at timeoutMs + 5000 and honours an
 // AbortSignal by rejecting locally (native keeps running; its reply is dropped).
-function guardedCall(native, feature, action, args, timeoutMs, signal) {
+// `onLate(reply)` hears a reply that arrives after the call already settled
+// (timeout or abort), so the caller can undo what that reply started.
+function guardedCall(native, feature, action, args, timeoutMs, signal, onLate) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) {
       reject(new DespiaError(ErrorCodes.ABORTED, feature + '.' + action + ' was aborted'));
@@ -103,7 +105,13 @@ function guardedCall(native, feature, action, args, timeoutMs, signal) {
       return;
     }
     Promise.resolve(pending).then(
-      (reply) => finish(resolve, reply),
+      (reply) => {
+        if (settled) {
+          if (onLate) onLate(reply);
+          return;
+        }
+        finish(resolve, reply);
+      },
       (e) => finish(reject, new DespiaError(ErrorCodes.INTERNAL, 'Bridge call failed: ' + (e && e.message)))
     );
   });
@@ -116,14 +124,15 @@ function createBridge(hub) {
   function probe(win) {
     const native = readNative(win);
     const inApp = !!native || isDespiaRuntime(win);
-    const legacyOnly = { inApp, native, hello: null };
+    const legacyOnly = { inApp, native, hello: null, refusal: null };
     if (!native) return Promise.resolve(legacyOnly);
     return guardedCall(native, 'bridge', 'hello', {}).then((reply) => {
       let hello = null;
       try {
         hello = cleanHello(unwrap(reply));
+        if (!hello) legacyOnly.refusal = new DespiaError(ErrorCodes.INTERNAL, 'bridge.hello: malformed answer');
       } catch (e) {
-        hello = null; // refused (for example forbidden_origin)
+        legacyOnly.refusal = e; // refused (for example forbidden_origin)
       }
       if (!hello) return legacyOnly;
       try {
@@ -131,8 +140,11 @@ function createBridge(hub) {
       } catch (e) {
         console.error('Despia bridge listen failed:', e);
       }
-      return { inApp: true, native, hello };
-    }, () => legacyOnly);
+      return { inApp: true, native, hello, refusal: null };
+    }, (e) => {
+      legacyOnly.refusal = e;
+      return legacyOnly;
+    });
   }
 
   // Resolves with { inApp, native, hello }; hello is null for legacy-only
@@ -149,14 +161,15 @@ function createBridge(hub) {
   }
 
   // One request over the bridge: resolves with the reply value.
-  function request(state, feature, action, args, timeoutMs, signal) {
-    return guardedCall(state.native, feature, action, args, timeoutMs, signal).then(unwrap);
+  function request(state, feature, action, args, timeoutMs, signal, onLate) {
+    return guardedCall(state.native, feature, action, args, timeoutMs, signal, onLate).then(unwrap);
   }
 
-  // A built-in `bridge` action. Goes straight to native when the object
-  // exists, so native's own refusal reaches the caller unchanged.
+  // A built-in `bridge` action. After the app refused hello the document is
+  // legacy-only, so the same refusal comes back without another native call.
   function builtin(action, args, signal) {
     return detect().then((state) => {
+      if (state.native && !state.hello && state.refusal) throw state.refusal;
       if (!state.native) {
         throw new DespiaError(
           state.inApp ? ErrorCodes.FEATURE_NOT_INSTALLED : ErrorCodes.NOT_IN_APP,
@@ -202,9 +215,27 @@ function createBridge(hub) {
     };
   }
 
-  // Asks native to replay stored events: since is { <jobId>: seq } or 'all'.
+  const MAX_SINCE_KEYS = 64;
+
+  // Asks native to replay stored events: since is { <jobId>: seq }, or 'all'
+  // for every job native still stores for the feature (resolved here, because
+  // the app only understands a map of jobs).
   function replay(feature, event, since) {
-    send('subscribe', { feature, events: [event], since });
+    if (since !== 'all') {
+      send('subscribe', { feature, events: [event], since });
+      return;
+    }
+    detect().then((state) => {
+      if (!state.hello) return null;
+      return request(state, 'bridge', 'jobs', { feature });
+    }).then((value) => {
+      const ids = value && Array.isArray(value.jobs) ? value.jobs.map((j) => j && j.jobId).filter((id) => typeof id === 'string') : [];
+      for (let i = 0; i < ids.length; i += MAX_SINCE_KEYS) {
+        const map = {};
+        ids.slice(i, i + MAX_SINCE_KEYS).forEach((id) => { map[id] = 0; });
+        send('subscribe', { feature, events: [event], since: map });
+      }
+    }).then(null, () => {});
   }
 
   return { detect, ready, request, builtin, track, replay };

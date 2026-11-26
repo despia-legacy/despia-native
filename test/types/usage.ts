@@ -22,8 +22,13 @@ async function typedCalls(): Promise<void> {
   // Results are typed per action.
   const nothing: void = await despia.haptics.light();
   const token: string = await despia.vault.get({ key: 'sessionToken' });
-  const version = await despia.device.app_version();
+  const version = await despia.device.appVersion();
   const versionNumber: string = version.versionNumber;
+  // Both spellings are typed; the wire name is the snake_case one.
+  const sameVersion: { versionNumber: string; bundleNumber: string } = await despia.device.app_version();
+  const storeA: string = await despia.device.storeLocation();
+  const storeB: string = await despia.device.store_location();
+  void sameVersion; void storeA; void storeB;
   const history = await despia.revenuecat.history();
   const active: boolean = history[0].isActive;
   void nothing; void token; void versionNumber; void active;
@@ -51,6 +56,7 @@ async function typedCalls(): Promise<void> {
 
   assertType<Equal<DespiaArgs<'vault', 'get'>, { key: string }>>();
   assertType<Equal<DespiaResult<'device', 'uuid'>, string>>();
+  assertType<Equal<DespiaResult<'device', 'appVersion'>, DespiaResult<'device', 'app_version'>>>();
 }
 
 function events(): void {

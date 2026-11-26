@@ -13,6 +13,7 @@
 // `variable` may be a name, a list of names, and may hold {argName} templates.
 
 const { DespiaError, ErrorCodes } = require('./errors');
+const { jsNameOK } = require('./names');
 
 function fillTemplate(template, args) {
   return template.replace(/\{([^}]+)\}/g, (_, name) => String(args[name]));
@@ -31,24 +32,42 @@ function buildCommand(legacy, args) {
   return command;
 }
 
-function watchList(legacy, args) {
-  return [].concat(legacy.variable || []).map((name) => fillTemplate(name, args));
+// The window variables to watch, with names filled in from args. Every name
+// must be one the legacy channel may delete and wait on; an arg that would
+// turn into a browser global is refused before anything is sent.
+function watchList(feature, action, legacy, args) {
+  return [].concat(legacy.variable || []).map((template) => {
+    const name = fillTemplate(template, args);
+    if (!jsNameOK(name)) {
+      const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
+      throw new DespiaError(
+        ErrorCodes.BAD_ARGS,
+        feature + '.' + action + ': "' + name + '" cannot be used as a window variable name',
+        arg ? 'args.' + arg : undefined
+      );
+    }
+    return name;
+  });
 }
 
-// The app's answer envelope: { ok: true, data } or { ok: false, error: { code, message } }.
+// The app's answer envelope: { ok: true, data } on success; on failure
+// { ok: false, error: '<message>', code: '<code>' }. An object-shaped
+// `error: { code, message }` is accepted too.
 function unwrapEnvelope(value) {
   if (value === null || typeof value !== 'object' || typeof value.ok !== 'boolean') return value;
   if (value.ok) return value.data;
-  const err = value.error && typeof value.error === 'object' ? value.error : {};
-  throw new DespiaError(
-    typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
-    typeof err.message === 'string' ? err.message : 'Native call failed'
-  );
+  const err = value.error;
+  const detail = err !== null && typeof err === 'object' ? err : {};
+  const code = typeof value.code === 'string' && value.code ? value.code
+    : typeof detail.code === 'string' && detail.code ? detail.code : ErrorCodes.INTERNAL;
+  const message = typeof err === 'string' && err ? err
+    : typeof detail.message === 'string' && detail.message ? detail.message : 'Native call failed';
+  throw new DespiaError(code, message);
 }
 
 function legacyCall(despiaFunction, feature, action, legacy, args) {
+  const watch = legacy.answer === 'none' ? [] : watchList(feature, action, legacy, args);
   const command = buildCommand(legacy, args);
-  const watch = legacy.answer === 'none' ? [] : watchList(legacy, args);
   if (watch.length === 0) return despiaFunction(command).then(() => undefined);
 
   return despiaFunction(command, watch).then((values) => {

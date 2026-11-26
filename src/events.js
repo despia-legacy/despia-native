@@ -8,6 +8,7 @@
 const REORDER_MS = 50;      // how long a live packet waits for a missing lower seq
 const MAX_EARLY = 1000;     // packets held for jobs not yet adopted
 const MAX_JOB_STATES = 512; // jobs whose ordering state is kept
+const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for
 
 function isObject(value) {
   return value !== null && typeof value === 'object';
@@ -47,7 +48,10 @@ function createEventHub() {
     const key = feature + '\u0000' + event;
     let set = byKey.get(key);
     if (!set) byKey.set(key, (set = new Set()));
-    const record = { fn, jobId: opts.jobId, since: opts.since };
+    // `seen` is the highest seq this listener has been given per job, so a
+    // packet that native replays more than once reaches it once.
+    const record = { fn, jobId: opts.jobId, since: opts.since, seen: new Map() };
+    if (typeof opts.since === 'number' && typeof opts.jobId === 'string') record.seen.set(opts.jobId, opts.since);
     return subscribe(set, record, () => {
       if (set.size === 0 && byKey.get(key) === set) byKey.delete(key);
     });
@@ -66,13 +70,20 @@ function createEventHub() {
     }
   }
 
-  function accepts(record, packet) {
+  function admit(record, packet) {
     if (record.jobId !== undefined && packet.jobId !== record.jobId) return false;
     if (packet.replay) {
       if (record.since === undefined) return false;
       if (typeof record.since === 'number' && typeof packet.seq === 'number' && packet.seq <= record.since) {
         return false;
       }
+    }
+    if (record.since !== undefined && typeof packet.jobId === 'string' && typeof packet.seq === 'number') {
+      const mark = record.seen.get(packet.jobId);
+      if (mark !== undefined && packet.seq <= mark) return false;
+      record.seen.delete(packet.jobId);
+      record.seen.set(packet.jobId, packet.seq);
+      if (record.seen.size > MAX_SEEN) record.seen.delete(record.seen.keys().next().value);
     }
     return true;
   }
@@ -83,7 +94,7 @@ function createEventHub() {
     const set = byKey.get(packet.feature + '\u0000' + packet.event);
     if (set) {
       Array.from(set).forEach((record) => {
-        if (accepts(record, packet)) call(record.fn, packet.data);
+        if (admit(record, packet)) call(record.fn, packet.data);
       });
     }
   }
@@ -97,8 +108,9 @@ function createEventHub() {
       if (states.size >= MAX_JOB_STATES) {
         const oldest = states.keys().next().value;
         const dropped = states.get(oldest);
-        if (dropped.timer) clearTimeout(dropped.timer);
         states.delete(oldest);
+        if (dropped.timer) clearTimeout(dropped.timer);
+        flushHeld(dropped); // never discard what was waiting for a gap
       }
     }
     states.set(jobId, state);
@@ -155,7 +167,7 @@ function createEventHub() {
   function hold(jobId, packet) {
     let list = early.get(jobId);
     if (!list) early.set(jobId, (list = []));
-    if (earlyCount >= MAX_EARLY) return;
+    if (earlyCount >= MAX_EARLY && packet.event !== 'done') return; // a terminal event is never dropped
     list.push(packet);
     earlyCount++;
   }
@@ -205,7 +217,14 @@ function createEventHub() {
     Array.from(early.keys()).forEach(release);
   }
 
-  return { on, onAny, intake, beginStart, adopt, endStart };
+  // Number of registered listeners (broadcast and per event).
+  function count() {
+    let total = broadcast.size;
+    byKey.forEach((set) => { total += set.size; });
+    return total;
+  }
+
+  return { on, onAny, intake, beginStart, adopt, endStart, count };
 }
 
 module.exports = { createEventHub };

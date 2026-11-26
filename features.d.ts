@@ -68,6 +68,18 @@ export interface DespiaFeatureMap {
   /** Facts about the app and the device it runs on. */
   device: {
     actions: {
+      /** Wire name: `app_version`. */
+      appVersion: {
+        kind: 'request';
+        args: void;
+        result: {
+          /** @maxLength 64 */
+          versionNumber: string;
+          /** @maxLength 64 */
+          bundleNumber: string;
+        };
+      };
+      /** Same as `appVersion`. */
       app_version: {
         kind: 'request';
         args: void;
@@ -83,6 +95,13 @@ export interface DespiaFeatureMap {
         args: void;
         result: string;
       };
+      /** Wire name: `store_location`. */
+      storeLocation: {
+        kind: 'request';
+        args: void;
+        result: string;
+      };
+      /** Same as `storeLocation`. */
       store_location: {
         kind: 'request';
         args: void;

@@ -288,16 +288,64 @@ test('replay: listeners that did not ask for it never see replayed packets; broa
   assert.deepStrictEqual(everything, ['replay', 'live']);
 });
 
-test("replay: since 'all' asks for every stored job of the feature", async () => {
-  const env = app();
+test("replay: since 'all' is resolved by the SDK into the jobs native still stores", async () => {
+  const stored = [{ jobId: 'j-a' }, { jobId: 'j-b' }];
+  const env = app({}, (call) => (call.feature === 'bridge' && call.action === 'jobs' ? ok({ jobs: stored }) : undefined));
   const got = [];
   env.despia.ffmpeg.on('done', (d) => got.push(d.jobId), { since: 'all' });
   await env.clock.tick(0);
+  assert.deepStrictEqual(env.calls.filter((c) => c.action === 'jobs').map((c) => c.args), [{ feature: 'ffmpeg' }]);
   const subscribes = env.calls.filter((c) => c.action === 'subscribe').map((c) => c.args);
-  assert.deepStrictEqual(subscribes[1], { feature: 'ffmpeg', events: ['done'], since: 'all' });
+  assert.deepStrictEqual(subscribes[1], { feature: 'ffmpeg', events: ['done'], since: { 'j-a': 0, 'j-b': 0 } });
+  assert.equal(subscribes.some((a) => a.since === 'all'), false, 'the string never goes on the wire');
   env.emit(ev('done', 1, { ok: true }, { replay: true, jobId: 'j-a', data: { jobId: 'j-a', ok: true } }));
   env.emit(ev('done', 1, { ok: true }, { replay: true, jobId: 'j-b', data: { jobId: 'j-b', ok: true } }));
   assert.deepStrictEqual(got, ['j-a', 'j-b']);
+});
+
+test("replay: since 'all' chunks more than 64 jobs and sends nothing when none are stored", async () => {
+  const many = Array.from({ length: 130 }, (_, i) => ({ jobId: 'j-' + i }));
+  const env = app({}, (call) => (call.feature === 'bridge' && call.action === 'jobs' ? ok({ jobs: many }) : undefined));
+  env.despia.ffmpeg.on('done', () => {}, { since: 'all' });
+  await env.clock.tick(0);
+  const withSince = env.calls.filter((c) => c.action === 'subscribe' && c.args.since);
+  assert.deepStrictEqual(withSince.map((c) => Object.keys(c.args.since).length), [64, 64, 2]);
+
+  const none = app({}, (call) => (call.feature === 'bridge' && call.action === 'jobs' ? ok({ jobs: [] }) : undefined));
+  none.despia.ffmpeg.on('done', () => {}, { since: 'all' });
+  await none.clock.tick(0);
+  assert.equal(none.calls.filter((c) => c.action === 'subscribe' && c.args.since).length, 0);
+});
+
+test('replay: a replayed packet reaches each since-listener once, however often native replays it', async () => {
+  const env = app();
+  const a = [];
+  const b = [];
+  env.despia.ffmpeg.on('done', (d) => a.push(d.jobId), { since: 'all' });
+  await env.clock.tick(0);
+  const done = (jobId) => ev('done', 3, { ok: true }, { replay: true, jobId, data: { jobId, ok: true } });
+  env.emit(done('j-a'));
+  // A second since-listener asks; native replays the stored events again.
+  env.despia.ffmpeg.on('done', (d) => b.push(d.jobId), { since: 'all' });
+  await env.clock.tick(0);
+  env.emit(done('j-a'));
+  assert.deepStrictEqual(a, ['j-a'], 'the first listener did not get it twice');
+  assert.deepStrictEqual(b, ['j-a']);
+});
+
+test('replay: a job-level replay does not feed a feature-level since-listener a second time', async () => {
+  const env = app();
+  const job = await env.despia.ffmpeg.run({ input: INPUT });
+  const doneSeen = [];
+  env.despia.ffmpeg.on('done', (d) => doneSeen.push(d.ok), { jobId: 'j-1', since: 0 });
+  await env.clock.tick(0);
+  env.emit(ev('done', 9, { ok: true }, { replay: true }));
+  // job.on(progress, since 0) makes native replay every event of the job again, done included.
+  job.on('progress', () => {}, { since: 0 });
+  await env.clock.tick(0);
+  env.emit(ev('progress', 2, { percent: 1 }, { replay: true }));
+  env.emit(ev('done', 9, { ok: true }, { replay: true }));
+  assert.deepStrictEqual(doneSeen, [true]);
 });
 
 test('replay: replayed seq numbers may skip (latest-only logs) and are not held back', async () => {
@@ -402,4 +450,63 @@ test('job: start honours AbortSignal', async () => {
   controller.abort();
   await started.done;
   assert.equal(started.error.code, 'aborted');
+});
+
+// ---- listener cleanup ----------------------------------------------------------
+
+test('a finished job leaves none of its own listeners in the hub', () => {
+  const { createEventHub } = require('../src/events');
+  const { createJob } = require('../src/jobs');
+  const hub = createEventHub();
+  const bridge = { builtin: () => Promise.resolve({}), replay() {} };
+  const baseline = hub.count();
+  const seen = [];
+  for (let n = 0; n < 50; n++) {
+    const id = 'j-' + n;
+    createJob({
+      hub, bridge, feature: 'ffmpeg', action: 'run', id,
+      callbacks: { progress: (d) => seen.push(d.percent), log: () => {}, done: () => seen.push('done'), error: () => {} }
+    });
+    hub.adopt(id);
+  }
+  assert.ok(hub.count() > baseline + 50, 'running jobs hold listeners');
+  for (let n = 0; n < 50; n++) {
+    hub.intake({ feature: 'ffmpeg', event: 'progress', jobId: 'j-' + n, seq: 1, data: { percent: n } });
+    hub.intake({ feature: 'ffmpeg', event: 'done', jobId: 'j-' + n, seq: 2, data: { ok: true } });
+  }
+  assert.equal(hub.count(), baseline, 'every start callback and tracker is gone');
+  assert.equal(seen.filter((x) => x === 'done').length, 50, 'each done callback still ran once');
+  assert.equal(seen.filter((x) => typeof x === 'number').length, 50);
+});
+
+test('done is never dropped from the early buffer, even when it is full', async () => {
+  const { createEventHub } = require('../src/events');
+  const hub = createEventHub();
+  const heard = [];
+  hub.onAny((p) => heard.push(p.event));
+  hub.beginStart();
+  for (let i = 1; i <= 1200; i++) hub.intake({ feature: 'f', event: 'progress', jobId: 'j-x', seq: i, data: {} });
+  hub.intake({ feature: 'f', event: 'done', jobId: 'j-x', seq: 1201, data: { ok: true } });
+  hub.endStart();
+  await new Promise((resolve) => setTimeout(resolve, 80)); // the gap wait releases it
+  assert.ok(heard.includes('done'));
+  assert.ok(heard.filter((e) => e === 'progress').length <= 1000);
+});
+
+// ---- an aborted or timed-out start ------------------------------------------------
+
+test('an aborted job start hands back nothing, leaks no listeners, and cancels the job when its reply arrives', async () => {
+  let reply;
+  const env = app({}, (call) => (call.feature === 'ffmpeg' ? new Promise((r) => { reply = r; }) : undefined));
+  const controller = new AbortController();
+  const started = outcome(env.despia.ffmpeg.run({ input: INPUT }, { progress: () => assert.fail('no handle, no callbacks') }, { signal: controller.signal }));
+  await env.clock.tick(0);
+  controller.abort();
+  await started.done;
+  assert.equal(started.error.code, 'aborted');
+  assert.equal(started.value, undefined);
+  reply(ok({ jobId: 'j-late' }));
+  await env.clock.tick(0);
+  assert.deepStrictEqual(sent(env, 'cancel').map((c) => c.args), [{ jobId: 'j-late' }]);
+  env.emit(ev('progress', 1, { percent: 1 }, { jobId: 'j-late', data: { jobId: 'j-late', percent: 1 } }));
 });

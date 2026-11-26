@@ -37,6 +37,7 @@
     const { DespiaError, ErrorCodes } = require('./errors');
     const { createJob, checkSince } = require('./jobs');
     const { legacyCall } = require('./legacycall');
+    const { jsNameOK } = require('./names');
 
     // Words the SDK keeps for itself on `despia.<word>`.
     const SDK_WORDS = ['legacy', 'on', 'jobs', 'bridge', 'ready'];
@@ -45,19 +46,22 @@
       'hello', 'subscribe', 'unsubscribe', 'jobs', 'job', 'cancel', 'ack', 'status', 'assets'
     ];
 
-    const RESERVED_JS_NAMES = [
-      'despia', '_despia', 'despiaBridge', '__despiaBridgeDeliver', '__proto__', 'constructor', 'prototype'
-    ];
-
     function isPlainObject(value) {
       return Object.prototype.toString.call(value) === '[object Object]';
     }
 
-    // A name the app may read from window: a plain identifier, not one the
-    // runtime reserves.
-    function jsNameOK(name) {
-      return typeof name === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
-        RESERVED_JS_NAMES.indexOf(name) === -1;
+    // Rejects with `aborted` as soon as the signal fires; the legacy call itself
+    // cannot be taken back, so its answer is dropped.
+    function raceAbort(promise, signal, where) {
+      if (!signal) return promise;
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(new DespiaError(ErrorCodes.ABORTED, where + ' was aborted'));
+        signal.addEventListener('abort', onAbort);
+        promise.then(
+          (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+          (err) => { signal.removeEventListener('abort', onAbort); reject(err); }
+        );
+      });
     }
 
     function badArgs(where, message) {
@@ -72,7 +76,13 @@
 
       function startJob(state, feature, action, spec, args, callbacks, signal) {
         hub.beginStart();
-        return bridge.request(state, feature, action, args, spec.timeoutMs, signal).then((value) => {
+        // A start reply that comes after the caller gave up (abort or local
+        // timeout) would leave a job running that nobody holds: cancel it.
+        const late = (reply) => {
+          const value = reply && reply.ok === true ? reply.value : null;
+          if (value && typeof value.jobId === 'string') bridge.builtin('cancel', { jobId: value.jobId }).then(null, () => {});
+        };
+        return bridge.request(state, feature, action, args, spec.timeoutMs, signal, late).then((value) => {
           const id = value && typeof value === 'object' ? value.jobId : undefined;
           if (typeof id !== 'string' || id === '') {
             throw new DespiaError(ErrorCodes.INTERNAL, feature + '.' + action + ': reply has no jobId');
@@ -104,7 +114,10 @@
               ? startJob(state, feature, action, spec, args, callbacks, signal)
               : bridge.request(state, feature, action, args, spec.timeoutMs, signal);
           }
-          if (!isJob && spec.legacy) return legacyCall(despiaFunction, feature, action, spec.legacy, args);
+          if (!isJob && spec.legacy) {
+            if (signal && signal.aborted) throw new DespiaError(ErrorCodes.ABORTED, where + ' was aborted');
+            return raceAbort(legacyCall(despiaFunction, feature, action, spec.legacy, args), signal, where);
+          }
           throw new DespiaError(
             ErrorCodes.FEATURE_NOT_INSTALLED,
             where + ' is not available in this app build'
@@ -158,17 +171,18 @@
         const ns = {};
         Object.keys(spec.actions).forEach((action) => {
           const actionSpec = spec.actions[action];
-          if (actionSpec.kind === 'job') {
-            ns[action] = function (args, callbacks, opts) {
+          // The wire name is `action`; `alias` is its camelCase spelling.
+          const names = actionSpec.alias ? [actionSpec.alias, action] : [action];
+          const method = actionSpec.kind === 'job'
+            ? function (args, callbacks, opts) {
               const problem = checkCallbacks(callbacks);
               if (problem) return badArgs(feature + '.' + action, problem);
               return invoke(feature, action, actionSpec, args, callbacks, optionsOf(opts).signal);
-            };
-          } else {
-            ns[action] = function (args, opts) {
+            }
+            : function (args, opts) {
               return invoke(feature, action, actionSpec, args, null, optionsOf(opts).signal);
             };
-          }
+          names.forEach((name) => { ns[name] = method; });
         });
         ns.on = function (event, fn, opts) {
           return listen(feature, event, fn, opts);
@@ -315,13 +329,15 @@
     function cleanHello(value) {
       if (!isObject(value) || !isObject(value.features)) return null;
       const hello = Object.assign({}, value);
-      delete hello.cap; // never part of anything the SDK hands out
+      delete hello.cap;
       return hello;
     }
 
     // One native call, guarded: gives up at timeoutMs + 5000 and honours an
     // AbortSignal by rejecting locally (native keeps running; its reply is dropped).
-    function guardedCall(native, feature, action, args, timeoutMs, signal) {
+    // `onLate(reply)` hears a reply that arrives after the call already settled
+    // (timeout or abort), so the caller can undo what that reply started.
+    function guardedCall(native, feature, action, args, timeoutMs, signal, onLate) {
       return new Promise((resolve, reject) => {
         if (signal && signal.aborted) {
           reject(new DespiaError(ErrorCodes.ABORTED, feature + '.' + action + ' was aborted'));
@@ -357,7 +373,13 @@
           return;
         }
         Promise.resolve(pending).then(
-          (reply) => finish(resolve, reply),
+          (reply) => {
+            if (settled) {
+              if (onLate) onLate(reply);
+              return;
+            }
+            finish(resolve, reply);
+          },
           (e) => finish(reject, new DespiaError(ErrorCodes.INTERNAL, 'Bridge call failed: ' + (e && e.message)))
         );
       });
@@ -370,14 +392,15 @@
       function probe(win) {
         const native = readNative(win);
         const inApp = !!native || isDespiaRuntime(win);
-        const legacyOnly = { inApp, native, hello: null };
+        const legacyOnly = { inApp, native, hello: null, refusal: null };
         if (!native) return Promise.resolve(legacyOnly);
         return guardedCall(native, 'bridge', 'hello', {}).then((reply) => {
           let hello = null;
           try {
             hello = cleanHello(unwrap(reply));
+            if (!hello) legacyOnly.refusal = new DespiaError(ErrorCodes.INTERNAL, 'bridge.hello: malformed answer');
           } catch (e) {
-            hello = null; // refused (for example forbidden_origin)
+            legacyOnly.refusal = e; // refused (for example forbidden_origin)
           }
           if (!hello) return legacyOnly;
           try {
@@ -385,8 +408,11 @@
           } catch (e) {
             console.error('Despia bridge listen failed:', e);
           }
-          return { inApp: true, native, hello };
-        }, () => legacyOnly);
+          return { inApp: true, native, hello, refusal: null };
+        }, (e) => {
+          legacyOnly.refusal = e;
+          return legacyOnly;
+        });
       }
 
       // Resolves with { inApp, native, hello }; hello is null for legacy-only
@@ -403,14 +429,15 @@
       }
 
       // One request over the bridge: resolves with the reply value.
-      function request(state, feature, action, args, timeoutMs, signal) {
-        return guardedCall(state.native, feature, action, args, timeoutMs, signal).then(unwrap);
+      function request(state, feature, action, args, timeoutMs, signal, onLate) {
+        return guardedCall(state.native, feature, action, args, timeoutMs, signal, onLate).then(unwrap);
       }
 
-      // A built-in `bridge` action. Goes straight to native when the object
-      // exists, so native's own refusal reaches the caller unchanged.
+      // A built-in `bridge` action. After the app refused hello the document is
+      // legacy-only, so the same refusal comes back without another native call.
       function builtin(action, args, signal) {
         return detect().then((state) => {
+          if (state.native && !state.hello && state.refusal) throw state.refusal;
           if (!state.native) {
             throw new DespiaError(
               state.inApp ? ErrorCodes.FEATURE_NOT_INSTALLED : ErrorCodes.NOT_IN_APP,
@@ -456,9 +483,27 @@
         };
       }
 
-      // Asks native to replay stored events: since is { <jobId>: seq } or 'all'.
+      const MAX_SINCE_KEYS = 64;
+
+      // Asks native to replay stored events: since is { <jobId>: seq }, or 'all'
+      // for every job native still stores for the feature (resolved here, because
+      // the app only understands a map of jobs).
       function replay(feature, event, since) {
-        send('subscribe', { feature, events: [event], since });
+        if (since !== 'all') {
+          send('subscribe', { feature, events: [event], since });
+          return;
+        }
+        detect().then((state) => {
+          if (!state.hello) return null;
+          return request(state, 'bridge', 'jobs', { feature });
+        }).then((value) => {
+          const ids = value && Array.isArray(value.jobs) ? value.jobs.map((j) => j && j.jobId).filter((id) => typeof id === 'string') : [];
+          for (let i = 0; i < ids.length; i += MAX_SINCE_KEYS) {
+            const map = {};
+            ids.slice(i, i + MAX_SINCE_KEYS).forEach((id) => { map[id] = 0; });
+            send('subscribe', { feature, events: [event], since: map });
+          }
+        }).then(null, () => {});
       }
 
       return { detect, ready, request, builtin, track, replay };
@@ -504,6 +549,7 @@
     const REORDER_MS = 50;      // how long a live packet waits for a missing lower seq
     const MAX_EARLY = 1000;     // packets held for jobs not yet adopted
     const MAX_JOB_STATES = 512; // jobs whose ordering state is kept
+    const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for
 
     function isObject(value) {
       return value !== null && typeof value === 'object';
@@ -543,7 +589,10 @@
         const key = feature + '\u0000' + event;
         let set = byKey.get(key);
         if (!set) byKey.set(key, (set = new Set()));
-        const record = { fn, jobId: opts.jobId, since: opts.since };
+        // `seen` is the highest seq this listener has been given per job, so a
+        // packet that native replays more than once reaches it once.
+        const record = { fn, jobId: opts.jobId, since: opts.since, seen: new Map() };
+        if (typeof opts.since === 'number' && typeof opts.jobId === 'string') record.seen.set(opts.jobId, opts.since);
         return subscribe(set, record, () => {
           if (set.size === 0 && byKey.get(key) === set) byKey.delete(key);
         });
@@ -562,13 +611,20 @@
         }
       }
 
-      function accepts(record, packet) {
+      function admit(record, packet) {
         if (record.jobId !== undefined && packet.jobId !== record.jobId) return false;
         if (packet.replay) {
           if (record.since === undefined) return false;
           if (typeof record.since === 'number' && typeof packet.seq === 'number' && packet.seq <= record.since) {
             return false;
           }
+        }
+        if (record.since !== undefined && typeof packet.jobId === 'string' && typeof packet.seq === 'number') {
+          const mark = record.seen.get(packet.jobId);
+          if (mark !== undefined && packet.seq <= mark) return false;
+          record.seen.delete(packet.jobId);
+          record.seen.set(packet.jobId, packet.seq);
+          if (record.seen.size > MAX_SEEN) record.seen.delete(record.seen.keys().next().value);
         }
         return true;
       }
@@ -579,7 +635,7 @@
         const set = byKey.get(packet.feature + '\u0000' + packet.event);
         if (set) {
           Array.from(set).forEach((record) => {
-            if (accepts(record, packet)) call(record.fn, packet.data);
+            if (admit(record, packet)) call(record.fn, packet.data);
           });
         }
       }
@@ -593,8 +649,9 @@
           if (states.size >= MAX_JOB_STATES) {
             const oldest = states.keys().next().value;
             const dropped = states.get(oldest);
-            if (dropped.timer) clearTimeout(dropped.timer);
             states.delete(oldest);
+            if (dropped.timer) clearTimeout(dropped.timer);
+            flushHeld(dropped); // never discard what was waiting for a gap
           }
         }
         states.set(jobId, state);
@@ -651,7 +708,7 @@
       function hold(jobId, packet) {
         let list = early.get(jobId);
         if (!list) early.set(jobId, (list = []));
-        if (earlyCount >= MAX_EARLY) return;
+        if (earlyCount >= MAX_EARLY && packet.event !== 'done') return; // a terminal event is never dropped
         list.push(packet);
         earlyCount++;
       }
@@ -701,7 +758,14 @@
         Array.from(early.keys()).forEach(release);
       }
 
-      return { on, onAny, intake, beginStart, adopt, endStart };
+      // Number of registered listeners (broadcast and per event).
+      function count() {
+        let total = broadcast.size;
+        byKey.forEach((set) => { total += set.size; });
+        return total;
+      }
+
+      return { on, onAny, intake, beginStart, adopt, endStart, count };
     }
 
     module.exports = { createEventHub };
@@ -806,6 +870,7 @@
         "actions": {
           "app_version": {
             "kind": "request",
+            "alias": "appVersion",
             "legacy": {
               "scheme": "getappversion",
               "args": [],
@@ -827,6 +892,7 @@
           },
           "store_location": {
             "kind": "request",
+            "alias": "storeLocation",
             "legacy": {
               "scheme": "getstorelocation",
               "args": [],
@@ -961,13 +1027,17 @@
     function createJob({ hub, bridge, feature, action, id, callbacks }) {
       let finished = null;
       const waiters = [];
+      const own = []; // the listeners this job registered itself: its tracker and start callbacks
 
-      // Tracks the terminal event. Replayed copies count too.
-      hub.on(feature, 'done', (done) => {
+      // Tracks the terminal event. Replayed copies count too. Once the job has
+      // ended nothing more can reach its own listeners, so they are removed (the
+      // dispatch in progress still completes for the ones already due).
+      own.push(hub.on(feature, 'done', (done) => {
         if (finished) return;
         finished = done;
         waiters.splice(0).forEach((settle) => settle(done));
-      }, { jobId: id, since: 'all' });
+        own.splice(0).forEach((off) => off());
+      }, { jobId: id, since: 'all' }));
 
       function on(event, fn, opts) {
         if (typeof event !== 'string' || event === '') {
@@ -1013,7 +1083,7 @@
       }
 
       const job = Object.freeze({ id, feature, action, on, result, cancel, ack });
-      Object.keys(callbacks || {}).forEach((event) => on(event, callbacks[event]));
+      Object.keys(callbacks || {}).forEach((event) => own.push(on(event, callbacks[event])));
       return job;
     }
 
@@ -1236,6 +1306,7 @@
     // `variable` may be a name, a list of names, and may hold {argName} templates.
 
     const { DespiaError, ErrorCodes } = require('./errors');
+    const { jsNameOK } = require('./names');
 
     function fillTemplate(template, args) {
       return template.replace(/\{([^}]+)\}/g, (_, name) => String(args[name]));
@@ -1254,24 +1325,42 @@
       return command;
     }
 
-    function watchList(legacy, args) {
-      return [].concat(legacy.variable || []).map((name) => fillTemplate(name, args));
+    // The window variables to watch, with names filled in from args. Every name
+    // must be one the legacy channel may delete and wait on; an arg that would
+    // turn into a browser global is refused before anything is sent.
+    function watchList(feature, action, legacy, args) {
+      return [].concat(legacy.variable || []).map((template) => {
+        const name = fillTemplate(template, args);
+        if (!jsNameOK(name)) {
+          const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
+          throw new DespiaError(
+            ErrorCodes.BAD_ARGS,
+            feature + '.' + action + ': "' + name + '" cannot be used as a window variable name',
+            arg ? 'args.' + arg : undefined
+          );
+        }
+        return name;
+      });
     }
 
-    // The app's answer envelope: { ok: true, data } or { ok: false, error: { code, message } }.
+    // The app's answer envelope: { ok: true, data } on success; on failure
+    // { ok: false, error: '<message>', code: '<code>' }. An object-shaped
+    // `error: { code, message }` is accepted too.
     function unwrapEnvelope(value) {
       if (value === null || typeof value !== 'object' || typeof value.ok !== 'boolean') return value;
       if (value.ok) return value.data;
-      const err = value.error && typeof value.error === 'object' ? value.error : {};
-      throw new DespiaError(
-        typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
-        typeof err.message === 'string' ? err.message : 'Native call failed'
-      );
+      const err = value.error;
+      const detail = err !== null && typeof err === 'object' ? err : {};
+      const code = typeof value.code === 'string' && value.code ? value.code
+        : typeof detail.code === 'string' && detail.code ? detail.code : ErrorCodes.INTERNAL;
+      const message = typeof err === 'string' && err ? err
+        : typeof detail.message === 'string' && detail.message ? detail.message : 'Native call failed';
+      throw new DespiaError(code, message);
     }
 
     function legacyCall(despiaFunction, feature, action, legacy, args) {
+      const watch = legacy.answer === 'none' ? [] : watchList(feature, action, legacy, args);
       const command = buildCommand(legacy, args);
-      const watch = legacy.answer === 'none' ? [] : watchList(legacy, args);
       if (watch.length === 0) return despiaFunction(command).then(() => undefined);
 
       return despiaFunction(command, watch).then((values) => {
@@ -1289,6 +1378,42 @@
     }
 
     module.exports = { legacyCall, buildCommand };
+  };
+
+  // ---- src/names.js ----
+  __modules['./names'] = function (module, exports, require) {
+    // Window variable names the SDK will read, wait on, or hand to the legacy
+    // channel as a variable to watch. The legacy channel deletes the variable
+    // before it waits for the app to write it, so a name that is a browser
+    // global or one the runtime itself uses must never get that far.
+
+    const RESERVED = [
+      // the runtime's own
+      'despia', '_despia', 'despiaBridge',
+      // object model
+      '__proto__', 'constructor', 'prototype', 'Object', 'Function', 'Array', 'String', 'Number', 'Boolean',
+      'Symbol', 'BigInt', 'Promise', 'Proxy', 'Reflect', 'JSON', 'Math', 'Date', 'RegExp', 'Error', 'Map',
+      'Set', 'WeakMap', 'WeakSet', 'eval', 'globalThis', 'undefined', 'NaN', 'Infinity',
+      // window and its relatives
+      'window', 'self', 'top', 'parent', 'frames', 'opener', 'closed', 'length', 'name', 'status', 'origin',
+      'document', 'location', 'history', 'navigator', 'screen', 'external', 'event', 'visualViewport',
+      // network, storage, timers, workers
+      'fetch', 'XMLHttpRequest', 'WebSocket', 'EventSource', 'Worker', 'SharedWorker', 'Request', 'Response',
+      'Headers', 'URL', 'Blob', 'File', 'FormData', 'localStorage', 'sessionStorage', 'indexedDB', 'caches',
+      'cookieStore', 'crypto', 'performance', 'console', 'setTimeout', 'setInterval', 'clearTimeout',
+      'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'postMessage', 'addEventListener',
+      'removeEventListener', 'dispatchEvent', 'alert', 'confirm', 'prompt', 'open', 'close', 'atob', 'btoa',
+      'queueMicrotask', 'structuredClone', 'WebAssembly', 'webkit', 'chrome', 'Android', 'AndroidBridge'
+    ];
+
+    function jsNameOK(name) {
+      return typeof name === 'string' &&
+        /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
+        name.indexOf('__') !== 0 &&
+        RESERVED.indexOf(name) === -1;
+    }
+
+    module.exports = { jsNameOK };
   };
 
   // ---- src/index.js ----

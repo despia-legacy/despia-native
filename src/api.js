@@ -15,6 +15,7 @@
 const { DespiaError, ErrorCodes } = require('./errors');
 const { createJob, checkSince } = require('./jobs');
 const { legacyCall } = require('./legacycall');
+const { jsNameOK } = require('./names');
 
 // Words the SDK keeps for itself on `despia.<word>`.
 const SDK_WORDS = ['legacy', 'on', 'jobs', 'bridge', 'ready'];
@@ -23,19 +24,22 @@ const BRIDGE_ACTIONS = [
   'hello', 'subscribe', 'unsubscribe', 'jobs', 'job', 'cancel', 'ack', 'status', 'assets'
 ];
 
-const RESERVED_JS_NAMES = [
-  'despia', '_despia', 'despiaBridge', '__despiaBridgeDeliver', '__proto__', 'constructor', 'prototype'
-];
-
 function isPlainObject(value) {
   return Object.prototype.toString.call(value) === '[object Object]';
 }
 
-// A name the app may read from window: a plain identifier, not one the
-// runtime reserves.
-function jsNameOK(name) {
-  return typeof name === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
-    RESERVED_JS_NAMES.indexOf(name) === -1;
+// Rejects with `aborted` as soon as the signal fires; the legacy call itself
+// cannot be taken back, so its answer is dropped.
+function raceAbort(promise, signal, where) {
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new DespiaError(ErrorCodes.ABORTED, where + ' was aborted'));
+    signal.addEventListener('abort', onAbort);
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); }
+    );
+  });
 }
 
 function badArgs(where, message) {
@@ -50,7 +54,13 @@ function createApi({ catalog, bridge, hub, despiaFunction, observeVariable }) {
 
   function startJob(state, feature, action, spec, args, callbacks, signal) {
     hub.beginStart();
-    return bridge.request(state, feature, action, args, spec.timeoutMs, signal).then((value) => {
+    // A start reply that comes after the caller gave up (abort or local
+    // timeout) would leave a job running that nobody holds: cancel it.
+    const late = (reply) => {
+      const value = reply && reply.ok === true ? reply.value : null;
+      if (value && typeof value.jobId === 'string') bridge.builtin('cancel', { jobId: value.jobId }).then(null, () => {});
+    };
+    return bridge.request(state, feature, action, args, spec.timeoutMs, signal, late).then((value) => {
       const id = value && typeof value === 'object' ? value.jobId : undefined;
       if (typeof id !== 'string' || id === '') {
         throw new DespiaError(ErrorCodes.INTERNAL, feature + '.' + action + ': reply has no jobId');
@@ -82,7 +92,10 @@ function createApi({ catalog, bridge, hub, despiaFunction, observeVariable }) {
           ? startJob(state, feature, action, spec, args, callbacks, signal)
           : bridge.request(state, feature, action, args, spec.timeoutMs, signal);
       }
-      if (!isJob && spec.legacy) return legacyCall(despiaFunction, feature, action, spec.legacy, args);
+      if (!isJob && spec.legacy) {
+        if (signal && signal.aborted) throw new DespiaError(ErrorCodes.ABORTED, where + ' was aborted');
+        return raceAbort(legacyCall(despiaFunction, feature, action, spec.legacy, args), signal, where);
+      }
       throw new DespiaError(
         ErrorCodes.FEATURE_NOT_INSTALLED,
         where + ' is not available in this app build'
@@ -136,17 +149,18 @@ function createApi({ catalog, bridge, hub, despiaFunction, observeVariable }) {
     const ns = {};
     Object.keys(spec.actions).forEach((action) => {
       const actionSpec = spec.actions[action];
-      if (actionSpec.kind === 'job') {
-        ns[action] = function (args, callbacks, opts) {
+      // The wire name is `action`; `alias` is its camelCase spelling.
+      const names = actionSpec.alias ? [actionSpec.alias, action] : [action];
+      const method = actionSpec.kind === 'job'
+        ? function (args, callbacks, opts) {
           const problem = checkCallbacks(callbacks);
           if (problem) return badArgs(feature + '.' + action, problem);
           return invoke(feature, action, actionSpec, args, callbacks, optionsOf(opts).signal);
-        };
-      } else {
-        ns[action] = function (args, opts) {
+        }
+        : function (args, opts) {
           return invoke(feature, action, actionSpec, args, null, optionsOf(opts).signal);
         };
-      }
+      names.forEach((name) => { ns[name] = method; });
     });
     ns.on = function (event, fn, opts) {
       return listen(feature, event, fn, opts);

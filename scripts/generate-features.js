@@ -60,6 +60,12 @@ const SCHEMA_KINDS = new Set([...ARG_KINDS, 'null']);
 const JSON_KINDS = new Set(['array', 'object', 'fileRef', 'json']);
 const ANSWERS = new Set(['envelope', 'variable', 'none']);
 
+// Wire action names are snake_case; the SDK also exposes the camelCase
+// spelling: the segment after each "_" is capitalised.
+function camelCase(name) {
+  return name.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+}
+
 function fail(where, message) {
   throw new Error(where + ': ' + message);
 }
@@ -88,6 +94,9 @@ function checkAssets(assets, where) {
     if (file.indexOf('\\') !== -1 || file.charAt(0) === '/') {
       fail(where, 'asset path "' + file + '" must be relative and use "/"');
     }
+    if (!/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/.test(file) && file.split('/').every((x) => x !== '.' && x !== '..' && x !== '')) {
+      fail(where, 'asset path "' + file + '" may only use letters, digits, ".", "_" and "-" between "/"');
+    }
     file.split('/').forEach((segment) => {
       if (segment === '.' || segment === '..' || segment === '') {
         fail(where, 'asset path "' + file + '" has a "' + segment + '" segment; "." and ".." are not allowed');
@@ -106,7 +115,7 @@ function checkLegacy(legacy, where) {
       fail(where, 'legacy.variable "' + name + '" is not a window variable name');
     }
   });
-  if (legacy.answer === 'variable' && !names.length) fail(where, 'legacy.answer "variable" needs legacy.variable');
+  if (legacy.answer !== 'none' && !names.length) fail(where, 'legacy.answer "' + legacy.answer + '" needs legacy.variable');
 }
 
 function checkFeature(id, feature, file) {
@@ -116,11 +125,21 @@ function checkFeature(id, feature, file) {
   if (!feature || typeof feature !== 'object') fail(where, 'feature must be an object');
   checkAssets(feature.assets, where);
   const actions = feature.actions || {};
+  const exposed = new Map(); // spelling -> action that owns it
   Object.keys(actions).forEach((name) => {
     const here = where + '.' + name;
     const action = actions[name];
     if (!ACTION_NAME.test(name)) fail(here, 'invalid action name');
+    if (/__|_$/.test(name)) fail(here, 'action name must not have a trailing or doubled "_"');
     if (RESERVED_ACTIONS.has(name)) fail(here, 'action name is reserved');
+    [name, camelCase(name)].forEach((spelling) => {
+      if (RESERVED_ACTIONS.has(spelling)) fail(here, 'its spelling "' + spelling + '" is reserved');
+      const other = exposed.get(spelling);
+      if (other !== undefined && other !== name) {
+        fail(where, 'actions "' + other + '" and "' + name + '" both expose "' + spelling + '" in camelCase');
+      }
+      exposed.set(spelling, name);
+    });
     if (!action || (action.kind !== 'request' && action.kind !== 'job')) fail(here, 'kind must be request or job');
     const args = action.args || {};
     Object.keys(args).forEach((arg) => {
@@ -128,10 +147,23 @@ function checkFeature(id, feature, file) {
       checkSchema(args[arg], here + '.' + arg, ARG_KINDS);
     });
     if (action.result) checkSchema(action.result, here + ' result', SCHEMA_KINDS);
-    if (action.timeoutMs !== undefined && !(Number.isInteger(action.timeoutMs) && action.timeoutMs > 0)) {
-      fail(here, 'timeoutMs must be a positive integer');
+    if (action.timeoutMs !== undefined &&
+        !(Number.isInteger(action.timeoutMs) && action.timeoutMs >= 100 && action.timeoutMs <= 600000)) {
+      fail(here, 'timeoutMs must be an integer from 100 to 600000');
     }
-    if (action.legacy) checkLegacy(action.legacy, here);
+    if (action.legacy) {
+      checkLegacy(action.legacy, here);
+      // A {name} in the variable becomes a window variable at run time, so it
+      // may only name a declared string argument.
+      [].concat(action.legacy.variable || []).forEach((template) => {
+        (template.match(/\{[^}]+\}/g) || []).forEach((hole) => {
+          const arg = args[hole.slice(1, -1)];
+          if (!arg || (arg.type !== 'string' && arg.type !== 'enum')) {
+            fail(here, 'legacy.variable "' + template + '" refers to ' + hole + ', which is not a declared string argument');
+          }
+        });
+      });
+    }
     if (action.kind === 'job') {
       [].concat((action.job && action.job.events) || []).forEach((event) => {
         if (!EVENT_NAME.test(event)) fail(here, 'invalid job event name "' + event + '"');
@@ -247,6 +279,25 @@ function doneType(action, events, pad) {
   return 'JobDone';
 }
 
+function actionType(action, events, pad) {
+  const inner = pad + '  ';
+  let out = '{\n';
+  out += inner + "kind: '" + action.kind + "';\n";
+  out += inner + 'args: ' + argsType(action.args, inner) + ';\n';
+  if (action.kind === 'job') {
+    out += inner + 'result: ' + doneType(action, events, inner) + ';\n';
+    out += inner + 'events: {\n';
+    jobEvents(action).filter((e) => e !== 'done').forEach((event) => {
+      const spec = events[event] || {};
+      out += inner + '  ' + key(event) + ': ' + withJobId(spec.data, inner + '  ') + ';\n';
+    });
+    out += inner + '};\n';
+  } else {
+    out += inner + 'result: ' + (action.result ? tsType(action.result, inner) : 'void') + ';\n';
+  }
+  return out + pad + '}';
+}
+
 function featureTypes(id, feature) {
   const actions = feature.actions || {};
   const events = feature.events || {};
@@ -259,22 +310,16 @@ function featureTypes(id, feature) {
   out += '  ' + key(id) + ': {\n    actions: {\n';
   Object.keys(actions).forEach((name) => {
     const action = actions[name];
-    out += doc([action.description], '      ');
-    out += '      ' + key(name) + ': {\n';
-    out += "        kind: '" + action.kind + "';\n";
-    out += '        args: ' + argsType(action.args, '        ') + ';\n';
-    if (action.kind === 'job') {
-      out += '        result: ' + doneType(action, events, '        ') + ';\n';
-      out += '        events: {\n';
-      jobEvents(action).filter((e) => e !== 'done').forEach((event) => {
-        const spec = events[event] || {};
-        out += '          ' + key(event) + ': ' + withJobId(spec.data, '          ') + ';\n';
-      });
-      out += '        };\n';
+    const camel = camelCase(name);
+    const body = actionType(action, events, '      ');
+    if (camel !== name) {
+      out += doc([action.description, 'Wire name: `' + name + '`.'], '      ');
+      out += '      ' + key(camel) + ': ' + body + ';\n';
+      out += doc(['Same as `' + camel + '`.'], '      ');
     } else {
-      out += '        result: ' + (action.result ? tsType(action.result, '        ') : 'void') + ';\n';
+      out += doc([action.description], '      ');
     }
-    out += '      };\n';
+    out += '      ' + key(name) + ': ' + body + ';\n';
   });
   out += '    };\n';
   if (!Object.keys(events).length) return out + '    events: {};\n  };\n';
@@ -323,6 +368,7 @@ function runtimeFeature(feature) {
   Object.keys(feature.actions || {}).forEach((name) => {
     const action = feature.actions[name];
     const out = { kind: action.kind };
+    if (camelCase(name) !== name) out.alias = camelCase(name);
     if (action.timeoutMs !== undefined) out.timeoutMs = action.timeoutMs;
     if (action.kind === 'job') out.events = jobEvents(action);
     if (action.legacy) out.legacy = runtimeLegacy(action);
@@ -420,4 +466,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { generate, readCatalogs, RESERVED_FEATURES };
+module.exports = { generate, readCatalogs, camelCase, RESERVED_FEATURES };

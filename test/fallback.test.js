@@ -29,10 +29,20 @@ function answers(win, command) {
   } else if (command === 'getpurchasehistory://') {
     later(500, () => { win.restoredData = [{ isActive: true, entitlementId: 'premium' }]; });
   } else if (command.indexOf('extension://notes/get?id=1') === 0) {
-    later(100, () => { win.notesResult = { ok: true, data: { text: 'hi' } }; });
+    later(100, () => { win.notesResult = envelope({ ok: true, data: { text: 'hi' } }); });
   } else if (command.indexOf('extension://notes/get?id=bad') === 0) {
-    later(100, () => { win.notesResult = { ok: false, error: { code: 'not_found', message: 'no note' } }; });
+    later(100, () => { win.notesResult = envelope({ ok: false, error: 'no note', code: 'not_found' }); });
+  } else if (command.indexOf('extension://notes/get?id=old') === 0) {
+    later(100, () => { win.notesResult = { ok: false, error: { code: 'disabled', message: 'switched off' } }; });
+  } else if (command.indexOf('extension://notes/get?id=slow') === 0) {
+    later(100, () => { win.notesResult = envelope({ ok: false, error: 'notes/get did not answer in 10000 ms', code: 'timeout' }); });
   }
+}
+
+// What the app writes for an envelope answer: the same fields on both
+// platforms, with `error` a plain message and `code` beside it.
+function envelope(fields) {
+  return Object.assign({ provider: 'despia', platform: 'ios', runtime: 'native', bridge: 'extension', extension: 'notes', route: 'get' }, fields);
 }
 
 function legacyApp(file, opts = {}) {
@@ -141,11 +151,65 @@ test('legacy fallback: an envelope answer is unwrapped; an error envelope reject
   const raw = (id) => (d) => d('extension://notes/get?id=' + id, ['notesResult']);
   let r = await sameAsRelease((d) => d.notes.get({ id: '1' }), raw('1'), { fixture: true });
   assert.deepStrictEqual(plain(r.typed.value), { text: 'hi' });
-  assert.deepStrictEqual(plain(r.raw.value), { notesResult: { ok: true, data: { text: 'hi' } } });
+  assert.deepStrictEqual(plain(r.raw.value), { notesResult: envelope({ ok: true, data: { text: 'hi' } }) });
 
   r = await sameAsRelease((d) => d.notes.get({ id: 'bad' }), raw('bad'), { fixture: true });
   assert.equal(r.typed.error.code, 'not_found');
   assert.equal(r.typed.error.message, 'no note');
+});
+
+test('legacy fallback: failure envelopes keep the code the app sent (top-level code, string error)', async () => {
+  for (const [id, code, message] of [
+    ['slow', 'timeout', 'notes/get did not answer in 10000 ms'],
+    ['bad', 'not_found', 'no note'],
+    ['old', 'disabled', 'switched off'] // object-shaped error, accepted as well
+  ]) {
+    const r = await sameAsRelease((d) => d.notes.get({ id }), (d) => d('extension://notes/get?id=' + id, ['notesResult']), { fixture: true });
+    assert.equal(r.typed.error.code, code, id);
+    assert.equal(r.typed.error.message, message, id);
+  }
+});
+
+test('legacy fallback: a variable built from an arg must be a name the channel may delete and watch', async () => {
+  const env = legacyApp(undefined, { fixture: true });
+  for (const key of ['fetch', '_despia', 'despia', 'despiaBridge', 'location', 'document', '__proto__', '__x', 'a b', '1x', '']) {
+    await assert.rejects(env.despia.vault.get({ key }), (err) => {
+      assert.equal(err.code, 'bad_args', key);
+      assert.equal(err.path, 'args.key');
+      return true;
+    }, key);
+  }
+  assert.deepStrictEqual(env.commands, [], 'nothing was sent');
+  assert.equal(typeof env.win.fetch === 'undefined', true, 'the test window has no fetch either way');
+  // A harmless key still works.
+  const ok = outcome(env.despia.vault.get({ key: 'sessionToken' }));
+  await env.clock.tick(1000);
+  assert.equal(ok.value, 'abc123');
+});
+
+test('legacy fallback: window globals survive a vault.get with a hostile key', async () => {
+  const env = legacyApp(undefined, { fixture: true });
+  env.win.fetch = function fetch() {};
+  env.win._despia = { keep: true };
+  await assert.rejects(env.despia.vault.get({ key: 'fetch' }), { code: 'bad_args' });
+  await assert.rejects(env.despia.vault.get({ key: '_despia' }), { code: 'bad_args' });
+  assert.equal(typeof env.win.fetch, 'function');
+  assert.deepStrictEqual(plain(env.win._despia), { keep: true });
+});
+
+test('legacy fallback: an aborted signal stops the legacy path too', async () => {
+  const env = legacyApp(undefined, { fixture: true });
+  const already = new AbortController();
+  already.abort();
+  await assert.rejects(env.despia.vault.set({ key: 'k', value: 'v' }, { signal: already.signal }), { code: 'aborted' });
+  assert.deepStrictEqual(env.commands, [], 'an aborted call sends nothing');
+
+  const controller = new AbortController();
+  const waiting = outcome(env.despia.vault.get({ key: 'sessionToken' }, { signal: controller.signal }));
+  await env.clock.tick(10);
+  controller.abort();
+  await waiting.done;
+  assert.equal(waiting.error.code, 'aborted');
 });
 
 test('legacy fallback: array and object args travel as one percent-encoded JSON parameter', async () => {

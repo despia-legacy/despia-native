@@ -158,7 +158,7 @@ Calls a native action with a plain JSON object and returns a `Promise` of its re
 
 ```ts
 const token: string = await despia.vault.get({ key: 'sessionToken' });
-const { versionNumber, bundleNumber } = await despia.device.app_version();
+const { versionNumber, bundleNumber } = await despia.device.appVersion();
 await despia.haptics.success();
 ```
 
@@ -189,11 +189,11 @@ await job.cancel();                // { cancelled, state }
 | `job.cancel()`                  | Asks the app to cancel                                                     |
 | `job.ack(seq)`                  | Tells the app it may forget stored events up to `seq`                      |
 
-Events carry a per-job `seq`. The SDK delivers them in that order and drops duplicates.
+Events carry a per-job `seq`. The SDK delivers them in that order and drops duplicates. Pass the callbacks to the call itself to see the very first events: they are attached before anything is delivered, while a listener added with `job.on()` after the call returns hears what comes next. The SDK removes a job's own callbacks once its `done` has been delivered.
 
 ### `despia.<feature>.on(event, listener, opts?)`
 
-Subscribes to one event of a feature. Returns an `off()` function.
+Subscribes to one event of a feature. Returns an `off()` function. Events come from the JSON bridge; in an older app build that only has protocol URLs, the callbacks the app calls on `window` (for example `onRevenueCatPurchase`) keep working as before and are not forwarded to `on()`.
 
 ```ts
 const off = despia.gps.on('change', (point) => updateMap(point.latitude, point.longitude));
@@ -209,7 +209,7 @@ despia.ffmpeg.on('progress', render, { jobId, since: 41 });
 despia.ffmpeg.on('done', record, { since: 'all' });
 ```
 
-Replayed events reach only listeners that passed `since`.
+Replayed events reach only listeners that passed `since`, and each of them gets a given event once.
 
 ### `despia.on(listener)`
 
@@ -271,7 +271,7 @@ Rejections are `despia.DespiaError` instances with a `code` and a `message`. Cod
 | -------------------- | ------------------------------------------------- | ---------- |
 | `despia.haptics`     | `light`, `heavy`, `success`, `warning`, `error`   |            |
 | `despia.vault`       | `set`, `get`                                      |            |
-| `despia.device`      | `app_version`, `uuid`, `store_location`           |            |
+| `despia.device`      | `appVersion`, `uuid`, `storeLocation`           |            |
 | `despia.revenuecat`  | `purchase`, `paywall`, `history`                  | `purchase` |
 | `despia.gps`         | `start`, `stop`                                   | `change`   |
 
@@ -285,7 +285,7 @@ Types ship with the package. Helper types are exported for your own wrappers:
 import despia, { type DespiaArgs, type DespiaResult, type Job, type EventPacket } from 'despia-native';
 
 type VaultGetArgs = DespiaArgs<'vault', 'get'>;   // { key: string }
-type Version = DespiaResult<'device', 'app_version'>;
+type Version = DespiaResult<'device', 'appVersion'>;
 ```
 
 `despia.LIMITS` holds the hard limits the app enforces (message size 4 MiB, in-flight requests, and so on). The SDK does not re-check them.
@@ -612,9 +612,9 @@ despia('reset://');
 ### App Information and Device Data
 
 ```js
-const { versionNumber, bundleNumber } = await despia.device.app_version();
+const { versionNumber, bundleNumber } = await despia.device.appVersion();
 const uuid          = await despia.device.uuid();
-const storeLocation = await despia.device.store_location();
+const storeLocation = await despia.device.storeLocation();
 
 // Not in the typed map yet:
 const { trackingDisabled } = await despia('user-disable-tracking://', ['trackingDisabled']);

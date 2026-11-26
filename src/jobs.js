@@ -23,13 +23,17 @@ function errorFrom(done) {
 function createJob({ hub, bridge, feature, action, id, callbacks }) {
   let finished = null;
   const waiters = [];
+  const own = []; // the listeners this job registered itself: its tracker and start callbacks
 
-  // Tracks the terminal event. Replayed copies count too.
-  hub.on(feature, 'done', (done) => {
+  // Tracks the terminal event. Replayed copies count too. Once the job has
+  // ended nothing more can reach its own listeners, so they are removed (the
+  // dispatch in progress still completes for the ones already due).
+  own.push(hub.on(feature, 'done', (done) => {
     if (finished) return;
     finished = done;
     waiters.splice(0).forEach((settle) => settle(done));
-  }, { jobId: id, since: 'all' });
+    own.splice(0).forEach((off) => off());
+  }, { jobId: id, since: 'all' }));
 
   function on(event, fn, opts) {
     if (typeof event !== 'string' || event === '') {
@@ -75,7 +79,7 @@ function createJob({ hub, bridge, feature, action, id, callbacks }) {
   }
 
   const job = Object.freeze({ id, feature, action, on, result, cancel, ack });
-  Object.keys(callbacks || {}).forEach((event) => on(event, callbacks[event]));
+  Object.keys(callbacks || {}).forEach((event) => own.push(on(event, callbacks[event])));
   return job;
 }
 

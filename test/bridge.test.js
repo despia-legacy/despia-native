@@ -122,7 +122,7 @@ test('request: AbortSignal rejects locally with aborted; native keeps running', 
   assert.equal(nativeCalls(env).length, before);
 });
 
-test('request: no cap field ever reaches the page', async () => {
+test('request: no transport-only field reaches the page', async () => {
   const hello = Object.assign({ cap: 'secret-token', contract: '1.1', origin: 'local_app' }, HELLO);
   const env = app(
     () => Object.assign(ok({ text: 'hi', echo: 1 }), { cap: 'secret-token' }),
@@ -248,6 +248,10 @@ test('despia.bridge.* reaches the built-in actions', async () => {
 test('despia.bridge.*: native refusals surface unchanged; no bridge rejects', async () => {
   const refused = app(() => fail('forbidden_origin', 'no'), { hello: null });
   await assert.rejects(refused.despia.bridge.status({ feature: 'x' }), { code: 'forbidden_origin' });
+
+  assert.equal(refused.calls.length, 1, 'only the hello reached native; the refusal is remembered');
+  await assert.rejects(refused.despia.jobs.list(), { code: 'forbidden_origin' });
+  assert.equal(refused.calls.length, 1);
 
   const old = loadSdk({ fixture: true, userAgent: DESPIA_UA });
   await assert.rejects(old.despia.bridge.hello(), { code: 'feature_not_installed' });

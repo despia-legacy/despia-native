@@ -77,6 +77,19 @@ test('types: job actions, callbacks, Job handle and file refs', () => {
       await despia.notes.search({ query: 'x' }, { done: () => {} });
     }
 
+    export async function spellings(): Promise<void> {
+      await despia.notes.setExpiry({ id: '1', seconds: 5 });
+      await despia.notes.set_expiry({ id: '1', seconds: 5 });
+      await despia.media.embeddedHide();
+      await despia.media.embedded_hide({ animated: false });
+      type Same = Equal<Parameters<typeof despia.notes.setExpiry>, Parameters<typeof despia.notes.set_expiry>>;
+      assertType<Same>();
+      // @ts-expect-error: seconds is required under either spelling
+      await despia.notes.setExpiry({ id: '1' });
+      // @ts-expect-error: seconds is required under either spelling
+      await despia.notes.set_expiry({ id: '1' });
+    }
+
     export function events(): void {
       despia.ffmpeg.on('progress', (d) => { const p: number = d.percent; void p; }, { jobId: 'j-1', since: 4 });
       despia.ffmpeg.on('done', (d) => { const ok: boolean = d.ok; void ok; });

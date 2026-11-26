@@ -154,3 +154,20 @@ test('generator CLI: --check passes on the shipped files and fails on a stale on
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('generator: a {name} in legacy.variable must name a declared string argument', () => {
+  const action = (args, variable) => ({ kind: 'request', args, legacy: { scheme: 'x', variable, answer: 'variable' } });
+  const run = (a) => () => generate(catalogWith({ tool: simple({ actions: { get: a } }) }));
+  run(action({ key: { type: 'string', max: 8 } }, '{key}'))();
+  assert.throws(run(action({}, '{key}')), /not a declared string argument/);
+  assert.throws(run(action({ key: { type: 'int' } }, '{key}')), /not a declared string argument/);
+});
+
+test('generator: envelope and variable answers need a variable; timeoutMs and asset names are bounded', () => {
+  const act = (extra) => ({ actions: { get: Object.assign({ kind: 'request', args: {} }, extra) } });
+  assert.throws(() => generate(catalogWith({ tool: simple(act({ legacy: { scheme: 'x', answer: 'envelope' } })) })), /needs legacy.variable/);
+  assert.throws(() => generate(catalogWith({ tool: simple(act({ timeoutMs: 50 })) })), /100 to 600000/);
+  assert.throws(() => generate(catalogWith({ tool: simple(act({ timeoutMs: 700000 })) })), /100 to 600000/);
+  generate(catalogWith({ tool: simple(act({ timeoutMs: 600000 })) }));
+  assert.throws(() => generate(catalogWith({ tool: simple({ assets: { files: ['%2e%2e/x'] } }) })), /may only use/);
+});
