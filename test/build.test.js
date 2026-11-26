@@ -171,3 +171,22 @@ test('generator: envelope and variable answers need a variable; timeoutMs and as
   generate(catalogWith({ tool: simple(act({ timeoutMs: 600000 })) }));
   assert.throws(() => generate(catalogWith({ tool: simple({ assets: { files: ['%2e%2e/x'] } }) })), /may only use/);
 });
+
+test('generator: a literal legacy variable must not be a name the page or the app uses', () => {
+  const run = (variable) => () => generate(catalogWith({
+    tool: simple({ actions: { go: { kind: 'request', args: {}, legacy: { scheme: 'x', answer: 'variable', variable } } } })
+  }));
+  ['location', 'AndroidVirtual', 'onerror', 'toString'].forEach((name) => {
+    assert.throws(run(name), /already uses/, name);
+  });
+  assert.throws(run(['versionNumber', 'fetch']), /already uses/);
+  run('versionNumber')();
+});
+
+test('generator: action spellings that shadow Object.prototype members are refused', () => {
+  const run = (name) => () => generate(catalogWith({
+    tool: simple({ actions: { [name]: { kind: 'request', args: {} } } })
+  }));
+  ['to_string', 'value_of', 'has_own_property', 'is_prototype_of', 'property_is_enumerable', 'to_locale_string']
+    .forEach((name) => assert.throws(run(name), /reserved/, name));
+});

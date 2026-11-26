@@ -122,10 +122,10 @@ test('types: the native object, Hello and statuses carry the 1.1 fields and no i
     const bad: Hello['contract'] = '2.0';
     // @ts-expect-error: origin is web or local_app
     const worse: Hello['origin'] = 'file';
-    // @ts-expect-error: no internal field on Hello
-    hello.cap;
-    // @ts-expect-error: no internal field on the native object
-    native.cap;
+    // @ts-expect-error: not a documented Hello field
+    hello.extra;
+    // @ts-expect-error: not a documented field of the native object
+    native.extra;
     void bad; void worse;
   `);
   assert.deepEqual(diagnostics, []);

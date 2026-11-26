@@ -8,7 +8,8 @@
 const REORDER_MS = 50;      // how long a live packet waits for a missing lower seq
 const MAX_EARLY = 1000;     // packets held for jobs not yet adopted
 const MAX_JOB_STATES = 512; // jobs whose ordering state is kept
-const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for
+const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for; past that the oldest mark is
+                            // forgotten and a later replay of that job reaches the listener again
 
 function isObject(value) {
   return value !== null && typeof value === 'object';

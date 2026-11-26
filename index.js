@@ -328,8 +328,11 @@
 
     function cleanHello(value) {
       if (!isObject(value) || !isObject(value.features)) return null;
-      const hello = Object.assign({}, value);
-      delete hello.cap;
+      // Only the documented fields are handed on.
+      const hello = {};
+      ['v', 'platform', 'features', 'limits', 'contract', 'origin'].forEach((key) => {
+        if (value[key] !== undefined) hello[key] = value[key];
+      });
       return hello;
     }
 
@@ -437,7 +440,9 @@
       // legacy-only, so the same refusal comes back without another native call.
       function builtin(action, args, signal) {
         return detect().then((state) => {
-          if (state.native && !state.hello && state.refusal) throw state.refusal;
+          if (state.native && !state.hello && state.refusal) {
+            throw new DespiaError(state.refusal.code, state.refusal.message, state.refusal.path);
+          }
           if (!state.native) {
             throw new DespiaError(
               state.inApp ? ErrorCodes.FEATURE_NOT_INSTALLED : ErrorCodes.NOT_IN_APP,
@@ -549,7 +554,8 @@
     const REORDER_MS = 50;      // how long a live packet waits for a missing lower seq
     const MAX_EARLY = 1000;     // packets held for jobs not yet adopted
     const MAX_JOB_STATES = 512; // jobs whose ordering state is kept
-    const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for
+    const MAX_SEEN = 256;       // jobs one listener remembers a replay mark for; past that the oldest mark is
+                                // forgotten and a later replay of that job reaches the listener again
 
     function isObject(value) {
       return value !== null && typeof value === 'object';
@@ -1331,13 +1337,19 @@
     function watchList(feature, action, legacy, args) {
       return [].concat(legacy.variable || []).map((template) => {
         const name = fillTemplate(template, args);
-        if (!jsNameOK(name)) {
-          const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
-          throw new DespiaError(
-            ErrorCodes.BAD_ARGS,
-            feature + '.' + action + ': "' + name + '" cannot be used as a window variable name',
-            arg ? 'args.' + arg : undefined
-          );
+        const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
+        const refuse = (why) => new DespiaError(
+          ErrorCodes.BAD_ARGS,
+          feature + '.' + action + ': "' + name + '" ' + why,
+          arg ? 'args.' + arg : undefined
+        );
+        if (!jsNameOK(name)) throw refuse('cannot be used as a window variable name');
+        // A name built from an argument must not point at an object or function
+        // the page or the app already put there: the watch deletes it first.
+        if (arg !== undefined && name !== template) {
+          let held;
+          try { held = typeof window !== 'undefined' ? typeof window[name] : 'undefined'; } catch (e) { held = 'object'; }
+          if (held === 'function' || held === 'object') throw refuse('is already in use on this page');
         }
         return name;
       });
@@ -1403,17 +1415,25 @@
       'cookieStore', 'crypto', 'performance', 'console', 'setTimeout', 'setInterval', 'clearTimeout',
       'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'postMessage', 'addEventListener',
       'removeEventListener', 'dispatchEvent', 'alert', 'confirm', 'prompt', 'open', 'close', 'atob', 'btoa',
-      'queueMicrotask', 'structuredClone', 'WebAssembly', 'webkit', 'chrome', 'Android', 'AndroidBridge'
+      'queueMicrotask', 'structuredClone', 'WebAssembly', 'webkit', 'chrome', 'Android', 'AndroidBridge',
+      // objects the apps put on the page themselves
+      'virtual', 'AndroidVirtual', 'nativeext', 'blob', 'DespiaSecure', 'DespiaNavigation', 'DespiaVisionBridge',
+      'DespiaWSAck', 'AndroidRefresh', 'AndroidClerk', 'NativeSpeechRecognition', '__despiaBridgeDeliver',
+      // Object.prototype members: replacing one changes every object on the page
+      'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString',
+      'toJSON', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__'
     ];
 
     function jsNameOK(name) {
       return typeof name === 'string' &&
         /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
         name.indexOf('__') !== 0 &&
+        // on<event> names are the page's own handler slots
+        !/^on[a-z]/.test(name) &&
         RESERVED.indexOf(name) === -1;
     }
 
-    module.exports = { jsNameOK };
+    module.exports = { jsNameOK, RESERVED };
   };
 
   // ---- src/index.js ----

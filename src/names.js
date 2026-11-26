@@ -21,14 +21,22 @@ const RESERVED = [
   'cookieStore', 'crypto', 'performance', 'console', 'setTimeout', 'setInterval', 'clearTimeout',
   'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'postMessage', 'addEventListener',
   'removeEventListener', 'dispatchEvent', 'alert', 'confirm', 'prompt', 'open', 'close', 'atob', 'btoa',
-  'queueMicrotask', 'structuredClone', 'WebAssembly', 'webkit', 'chrome', 'Android', 'AndroidBridge'
+  'queueMicrotask', 'structuredClone', 'WebAssembly', 'webkit', 'chrome', 'Android', 'AndroidBridge',
+  // objects the apps put on the page themselves
+  'virtual', 'AndroidVirtual', 'nativeext', 'blob', 'DespiaSecure', 'DespiaNavigation', 'DespiaVisionBridge',
+  'DespiaWSAck', 'AndroidRefresh', 'AndroidClerk', 'NativeSpeechRecognition', '__despiaBridgeDeliver',
+  // Object.prototype members: replacing one changes every object on the page
+  'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString',
+  'toJSON', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__'
 ];
 
 function jsNameOK(name) {
   return typeof name === 'string' &&
     /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
     name.indexOf('__') !== 0 &&
+    // on<event> names are the page's own handler slots
+    !/^on[a-z]/.test(name) &&
     RESERVED.indexOf(name) === -1;
 }
 
-module.exports = { jsNameOK };
+module.exports = { jsNameOK, RESERVED };

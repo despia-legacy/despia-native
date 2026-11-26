@@ -122,19 +122,19 @@ test('request: AbortSignal rejects locally with aborted; native keeps running', 
   assert.equal(nativeCalls(env).length, before);
 });
 
-test('request: no transport-only field reaches the page', async () => {
-  const hello = Object.assign({ cap: 'secret-token', contract: '1.1', origin: 'local_app' }, HELLO);
+test('hello: only the documented fields reach the page', async () => {
+  const hello = Object.assign({ extra: 'unlisted-value', contract: '1.1', origin: 'local_app' }, HELLO);
   const env = app(
-    () => Object.assign(ok({ text: 'hi', echo: 1 }), { cap: 'secret-token' }),
-    { hello: () => Object.assign(ok(hello), { cap: 'secret-token' }) }
+    () => ok({ text: 'hi', echo: 1 }),
+    { hello: () => ok(hello) }
   );
   const value = await env.despia.notes.get({ id: '1' });
   assert.deepStrictEqual(plain(value), { text: 'hi', echo: 1 });
   const ready = await env.despia.ready();
-  assert.equal('cap' in ready.hello, false);
-  assert.equal(JSON.stringify(ready).indexOf('secret-token'), -1);
+  assert.equal('extra' in ready.hello, false);
+  assert.equal(JSON.stringify(ready).indexOf('unlisted-value'), -1);
   const viaBuiltin = await env.despia.bridge.hello();
-  assert.equal('cap' in viaBuiltin, false);
+  assert.equal('extra' in viaBuiltin, false);
   assert.equal(ready.hello.contract, '1.1');
   assert.equal(ready.hello.origin, 'local_app');
 });

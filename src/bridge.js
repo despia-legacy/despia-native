@@ -60,8 +60,11 @@ function unwrap(reply) {
 
 function cleanHello(value) {
   if (!isObject(value) || !isObject(value.features)) return null;
-  const hello = Object.assign({}, value);
-  delete hello.cap;
+  // Only the documented fields are handed on.
+  const hello = {};
+  ['v', 'platform', 'features', 'limits', 'contract', 'origin'].forEach((key) => {
+    if (value[key] !== undefined) hello[key] = value[key];
+  });
   return hello;
 }
 
@@ -169,7 +172,9 @@ function createBridge(hub) {
   // legacy-only, so the same refusal comes back without another native call.
   function builtin(action, args, signal) {
     return detect().then((state) => {
-      if (state.native && !state.hello && state.refusal) throw state.refusal;
+      if (state.native && !state.hello && state.refusal) {
+        throw new DespiaError(state.refusal.code, state.refusal.message, state.refusal.path);
+      }
       if (!state.native) {
         throw new DespiaError(
           state.inApp ? ErrorCodes.FEATURE_NOT_INSTALLED : ErrorCodes.NOT_IN_APP,

@@ -39,6 +39,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { jsNameOK } = require('../src/names');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -48,7 +49,8 @@ const RESERVED_FEATURES = new Set([
   'bridge', 'legacy', 'jobs', 'on', 'off', 'ready', 'version', 'call',
   'then', 'apply', 'bind', 'length', 'name', 'prototype', 'arguments', 'caller', 'constructor'
 ]);
-const RESERVED_ACTIONS = new Set(['on', 'then']);
+const RESERVED_ACTIONS = new Set(['on', 'then', 'constructor', 'toString', 'valueOf', 'hasOwnProperty',
+  'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString', 'toJSON']);
 const FEATURE_ID = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
 const ACTION_NAME = /^[a-z][a-z0-9_]{0,31}$/;
 const ARG_NAME = /^[a-z][a-zA-Z0-9_]{0,63}$/;
@@ -114,6 +116,9 @@ function checkLegacy(legacy, where) {
     if (typeof name !== 'string' || !IDENT.test(name.replace(/\{[^}]+\}/g, 'x'))) {
       fail(where, 'legacy.variable "' + name + '" is not a window variable name');
     }
+    if (!/\{[^}]+\}/.test(name) && !jsNameOK(name)) {
+      fail(where, 'legacy.variable "' + name + '" is a name the page or the app already uses');
+    }
   });
   if (legacy.answer !== 'none' && !names.length) fail(where, 'legacy.answer "' + legacy.answer + '" needs legacy.variable');
 }
@@ -130,7 +135,7 @@ function checkFeature(id, feature, file) {
     const here = where + '.' + name;
     const action = actions[name];
     if (!ACTION_NAME.test(name)) fail(here, 'invalid action name');
-    if (/__|_$/.test(name)) fail(here, 'action name must not have a trailing or doubled "_"');
+    if (/__|_$/.test(name)) fail(here, 'action name must not have a trailing or doubled "_" (its camelCase form would be ambiguous)');
     if (RESERVED_ACTIONS.has(name)) fail(here, 'action name is reserved');
     [name, camelCase(name)].forEach((spelling) => {
       if (RESERVED_ACTIONS.has(spelling)) fail(here, 'its spelling "' + spelling + '" is reserved');

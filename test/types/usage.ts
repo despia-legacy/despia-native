@@ -136,8 +136,8 @@ async function bridgeWords(): Promise<void> {
   const native: Window['despiaBridge'] = window.despiaBridge;
   void bridge; void list; void one; void cancelled; void dep; void hello; void offJob; void max; void noop; void cb; void native;
 
-  // @ts-expect-error: the injected object's internal field is not part of any SDK type
-  void hello.cap;
+  // @ts-expect-error: not a documented Hello field
+  void hello.extra;
   // @ts-expect-error: no such built-in action
   await despia.bridge.nope();
 }

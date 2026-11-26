@@ -38,13 +38,19 @@ function buildCommand(legacy, args) {
 function watchList(feature, action, legacy, args) {
   return [].concat(legacy.variable || []).map((template) => {
     const name = fillTemplate(template, args);
-    if (!jsNameOK(name)) {
-      const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
-      throw new DespiaError(
-        ErrorCodes.BAD_ARGS,
-        feature + '.' + action + ': "' + name + '" cannot be used as a window variable name',
-        arg ? 'args.' + arg : undefined
-      );
+    const arg = (/\{([^}]+)\}/.exec(template) || [])[1];
+    const refuse = (why) => new DespiaError(
+      ErrorCodes.BAD_ARGS,
+      feature + '.' + action + ': "' + name + '" ' + why,
+      arg ? 'args.' + arg : undefined
+    );
+    if (!jsNameOK(name)) throw refuse('cannot be used as a window variable name');
+    // A name built from an argument must not point at an object or function
+    // the page or the app already put there: the watch deletes it first.
+    if (arg !== undefined && name !== template) {
+      let held;
+      try { held = typeof window !== 'undefined' ? typeof window[name] : 'undefined'; } catch (e) { held = 'object'; }
+      if (held === 'function' || held === 'object') throw refuse('is already in use on this page');
     }
     return name;
   });
