@@ -1,0 +1,400 @@
+{
+  "features": {
+    "vault": {
+      "actions": {
+        "set": {
+          "kind": "request",
+          "args": {
+            "key": {
+              "type": "string",
+              "required": true,
+              "min": 1,
+              "max": 256
+            },
+            "value": {
+              "type": "string",
+              "required": true,
+              "max": 65536
+            },
+            "locked": {
+              "type": "bool"
+            }
+          },
+          "legacy": {
+            "scheme": "setvault",
+            "answer": "none"
+          }
+        },
+        "get": {
+          "kind": "request",
+          "args": {
+            "key": {
+              "type": "string",
+              "required": true,
+              "min": 1,
+              "max": 256
+            }
+          },
+          "result": {
+            "type": "string"
+          },
+          "legacy": {
+            "scheme": "readvault",
+            "variable": "{key}",
+            "answer": "variable"
+          }
+        }
+      },
+      "events": {}
+    },
+    "notes": {
+      "description": "Request actions: one with a legacy mapping, one without.",
+      "actions": {
+        "get": {
+          "kind": "request",
+          "args": {
+            "id": {
+              "type": "string",
+              "required": true,
+              "max": 64
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "max": 32
+              },
+              "maxItems": 8
+            }
+          },
+          "result": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "required": true,
+                "max": 1000
+              }
+            }
+          },
+          "timeoutMs": 2000,
+          "legacy": {
+            "scheme": "extension",
+            "host": "notes",
+            "route": "get",
+            "variable": "notesResult",
+            "callback": "onNotes",
+            "answer": "envelope"
+          }
+        },
+        "set_expiry": {
+          "kind": "request",
+          "description": "Snake_case on the wire, camelCase in the SDK.",
+          "args": {
+            "id": {
+              "type": "string",
+              "required": true,
+              "max": 64
+            },
+            "seconds": {
+              "type": "int",
+              "required": true,
+              "min": 0
+            }
+          },
+          "legacy": {
+            "scheme": "extension",
+            "host": "notes",
+            "route": "set_expiry",
+            "answer": "none"
+          }
+        },
+        "search": {
+          "kind": "request",
+          "args": {
+            "query": {
+              "type": "string",
+              "required": true,
+              "max": 128
+            }
+          },
+          "result": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "max": 128
+            },
+            "maxItems": 100
+          }
+        }
+      },
+      "events": {}
+    },
+    "media": {
+      "actions": {
+        "pick": {
+          "kind": "request",
+          "args": {
+            "kind": {
+              "type": "enum",
+              "values": [
+                "image",
+                "video"
+              ],
+              "required": true
+            },
+            "from": {
+              "type": "fileRef"
+            }
+          },
+          "result": {
+            "type": "fileRef",
+            "nullable": true
+          },
+          "timeoutMs": 30000
+        },
+        "embedded_hide": {
+          "kind": "request",
+          "args": {
+            "animated": {
+              "type": "bool"
+            }
+          }
+        },
+        "capture": {
+          "kind": "request",
+          "description": "Ends once: a file, or the user backing out.",
+          "args": {
+            "camera": {
+              "type": "enum",
+              "values": [
+                "front",
+                "back"
+              ]
+            }
+          },
+          "returns": {
+            "statuses": {
+              "success": {
+                "data": {
+                  "type": "object",
+                  "properties": {
+                    "file": {
+                      "type": "fileRef",
+                      "required": true
+                    },
+                    "width": {
+                      "type": "int"
+                    }
+                  }
+                }
+              },
+              "cancelled": {
+                "description": "The user closed the camera."
+              }
+            }
+          },
+          "legacy": {
+            "scheme": "extension",
+            "host": "media",
+            "route": "capture",
+            "variable": "captureResult",
+            "answer": "envelope",
+            "cancelWhen": {
+              "code": "cancelled"
+            }
+          }
+        },
+        "scan": {
+          "kind": "request",
+          "description": "Outcome action whose default status is not success; the legacy answer names the cancel.",
+          "args": {},
+          "returns": {
+            "statuses": {
+              "scanned": {
+                "data": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "cancelled": {}
+            },
+            "default": "scanned"
+          },
+          "legacy": {
+            "scheme": "scan",
+            "variable": "scanResult",
+            "answer": "variable",
+            "cancelWhen": {
+              "equals": "cancelled"
+            }
+          }
+        }
+      },
+      "events": {}
+    },
+    "ffmpeg": {
+      "description": "A job action: progress, log and done.",
+      "assets": {
+        "files": [
+          "ffmpeg-core.wasm",
+          "worker/ffmpeg.js"
+        ]
+      },
+      "actions": {
+        "run": {
+          "kind": "job",
+          "args": {
+            "input": {
+              "type": "fileRef",
+              "required": true
+            },
+            "preset": {
+              "type": "enum",
+              "values": [
+                "fast",
+                "small"
+              ]
+            }
+          },
+          "job": {
+            "events": [
+              "progress",
+              "log",
+              "done"
+            ],
+            "scope": "document",
+            "durable": true
+          }
+        },
+        "transcode": {
+          "kind": "job",
+          "args": {
+            "input": {
+              "type": "fileRef",
+              "required": true
+            }
+          },
+          "returns": {
+            "statuses": {
+              "success": {
+                "data": {
+                  "type": "object",
+                  "properties": {
+                    "output": {
+                      "type": "fileRef",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "cancelled": {},
+              "navigated": {
+                "description": "The page went away before the job ended."
+              }
+            }
+          },
+          "job": {
+            "events": [
+              "progress",
+              "done"
+            ],
+            "scope": "document",
+            "durable": true
+          }
+        },
+        "thumbnail": {
+          "kind": "job",
+          "description": "Declares only success: cancelled and navigated still end it.",
+          "args": {
+            "input": {
+              "type": "fileRef",
+              "required": true
+            }
+          },
+          "returns": {
+            "statuses": {
+              "success": {
+                "data": {
+                  "type": "object",
+                  "properties": {
+                    "output": {
+                      "type": "fileRef",
+                      "required": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "job": {
+            "events": [
+              "progress",
+              "done"
+            ],
+            "scope": "document",
+            "durable": true
+          }
+        }
+      },
+      "events": {
+        "progress": {
+          "scope": "document",
+          "data": {
+            "type": "object",
+            "properties": {
+              "percent": {
+                "type": "number",
+                "required": true
+              },
+              "time": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "log": {
+          "scope": "document",
+          "data": {
+            "type": "object",
+            "properties": {
+              "level": {
+                "type": "enum",
+                "values": [
+                  "info",
+                  "warn"
+                ],
+                "required": true
+              },
+              "line": {
+                "type": "string",
+                "required": true,
+                "max": 1000
+              }
+            }
+          }
+        },
+        "done": {
+          "scope": "document",
+          "data": {
+            "type": "object",
+            "properties": {
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "fileRef"
+                },
+                "maxItems": 8
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

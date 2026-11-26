@@ -1,0 +1,156 @@
+{
+  "features": {
+    "haptics": {
+      "description": "Vibration feedback.",
+      "actions": {
+        "light": { "kind": "request", "description": "Subtle tap.", "args": {}, "legacy": { "scheme": "lighthaptic", "answer": "none" } },
+        "heavy": { "kind": "request", "description": "Strong tap.", "args": {}, "legacy": { "scheme": "heavyhaptic", "answer": "none" } },
+        "success": { "kind": "request", "args": {}, "legacy": { "scheme": "successhaptic", "answer": "none" } },
+        "warning": { "kind": "request", "args": {}, "legacy": { "scheme": "warninghaptic", "answer": "none" } },
+        "error": { "kind": "request", "args": {}, "legacy": { "scheme": "errorhaptic", "answer": "none" } }
+      },
+      "events": {}
+    },
+
+    "vault": {
+      "description": "Encrypted key-value storage that survives reinstall.",
+      "actions": {
+        "set": {
+          "kind": "request",
+          "description": "Store a value in the encrypted, backed-up vault.",
+          "args": {
+            "key": { "type": "string", "required": true, "min": 1, "max": 256 },
+            "value": { "type": "string", "required": true, "max": 65536 },
+            "locked": { "type": "bool", "description": "Require Face ID, Touch ID or fingerprint to read it back." }
+          },
+          "legacy": { "scheme": "setvault", "answer": "none" }
+        },
+        "get": {
+          "kind": "request",
+          "description": "Read a value; prompts for biometrics when it was stored locked.",
+          "args": {
+            "key": { "type": "string", "required": true, "min": 1, "max": 256 }
+          },
+          "result": { "type": "string" },
+          "legacy": { "scheme": "readvault", "variable": "{key}", "answer": "variable" }
+        }
+      },
+      "events": {}
+    },
+
+    "device": {
+      "description": "Facts about the app and the device it runs on.",
+      "actions": {
+        "app_version": {
+          "kind": "request",
+          "args": {},
+          "result": {
+            "type": "object",
+            "properties": {
+              "versionNumber": { "type": "string", "required": true, "max": 64 },
+              "bundleNumber": { "type": "string", "required": true, "max": 64 }
+            }
+          },
+          "legacy": { "scheme": "getappversion", "variable": ["versionNumber", "bundleNumber"], "answer": "variable" }
+        },
+        "uuid": {
+          "kind": "request",
+          "args": {},
+          "result": { "type": "string" },
+          "legacy": { "scheme": "get-uuid", "variable": "uuid", "answer": "variable" }
+        },
+        "store_location": {
+          "kind": "request",
+          "args": {},
+          "result": { "type": "string" },
+          "legacy": { "scheme": "getstorelocation", "variable": "storeLocation", "answer": "variable" }
+        }
+      },
+      "events": {}
+    },
+
+    "revenuecat": {
+      "description": "In-app purchases through RevenueCat.",
+      "actions": {
+        "purchase": {
+          "kind": "request",
+          "args": {
+            "externalId": { "type": "string", "required": true, "min": 1, "max": 256, "description": "Your user id.", "legacy": { "name": "external_id" } },
+            "product": { "type": "string", "required": true, "min": 1, "max": 256, "description": "Store product id." }
+          },
+          "legacy": { "scheme": "revenuecat", "host": "purchase", "answer": "none" }
+        },
+        "paywall": {
+          "kind": "request",
+          "args": {
+            "externalId": { "type": "string", "required": true, "min": 1, "max": 256, "description": "Your user id.", "legacy": { "name": "external_id" } },
+            "offering": { "type": "string", "min": 1, "max": 256 }
+          },
+          "legacy": { "scheme": "revenuecat", "host": "launchPaywall", "answer": "none" }
+        },
+        "history": {
+          "kind": "request",
+          "args": {},
+          "result": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "isActive": { "type": "bool", "required": true },
+                "entitlementId": { "type": "string", "required": true, "max": 256 },
+                "productId": { "type": "string", "max": 256 }
+              }
+            }
+          },
+          "legacy": { "scheme": "getpurchasehistory", "variable": "restoredData", "answer": "variable" }
+        }
+      },
+      "events": {
+        "purchase": {
+          "scope": "app",
+          "callback": "onRevenueCatPurchase",
+          "description": "The store confirmed a transaction.",
+          "data": { "type": "object", "additionalProperties": true, "properties": {} }
+        }
+      }
+    },
+
+    "gps": {
+      "description": "Background location.",
+      "actions": {
+        "start": {
+          "kind": "request",
+          "args": {
+            "buffer": { "type": "int", "min": 1, "description": "Seconds between points." },
+            "movement": { "type": "int", "min": 0, "description": "Movement threshold in centimetres." },
+            "server": { "type": "string", "min": 1, "max": 2048, "description": "POST each point to this URL." }
+          },
+          "legacy": { "scheme": "location", "answer": "none" }
+        },
+        "stop": {
+          "kind": "request",
+          "args": {},
+          "result": { "type": "json", "maxBytes": 65536 },
+          "legacy": { "scheme": "stoplocation", "variable": "locationSession", "answer": "variable" }
+        }
+      },
+      "events": {
+        "change": {
+          "scope": "app",
+          "callback": "onLocationChange",
+          "data": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "active": { "type": "bool", "required": true },
+              "latitude": { "type": "number", "required": true },
+              "longitude": { "type": "number", "required": true }
+            }
+          }
+        }
+      }
+    }
+  }
+}
