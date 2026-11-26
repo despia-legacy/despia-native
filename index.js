@@ -22,174 +22,472 @@
 
   // ---- src/api.js ----
   __modules['./api'] = function (module, exports, require) {
-    // Typed API: despia.<feature>.<action>(args) and despia.<feature>.on(event, fn).
-    // Routes each call to the JSON bridge, else to the feature's legacy scheme,
-    // else rejects with not_in_app.
+    // Typed API built from the catalog:
+    //
+    //   despia.<feature>.<action>(args?, opts?)              request -> Promise<Result>
+    //   despia.<feature>.<action>(args?, callbacks?, opts?)  job     -> Promise<Job>
+    //   despia.<feature>.on(event, fn, { since?, jobId? })   -> off
+    //   despia.on(fn)                                        every packet -> off
+    //   despia.jobs.list / get / cancel, despia.bridge.*, despia.ready()
+    //
+    // Each action goes over the JSON bridge when this document has one and the
+    // app lists the action; otherwise over its legacy scheme when the catalog
+    // has one; otherwise it rejects.
 
     const { DespiaError, ErrorCodes } = require('./errors');
+    const { createJob, checkSince } = require('./jobs');
+    const { legacyCall } = require('./legacycall');
+
+    // Words the SDK keeps for itself on `despia.<word>`.
+    const SDK_WORDS = ['legacy', 'on', 'jobs', 'bridge', 'ready'];
+
+    const BRIDGE_ACTIONS = [
+      'hello', 'subscribe', 'unsubscribe', 'jobs', 'job', 'cancel', 'ack', 'status', 'assets'
+    ];
+
+    const RESERVED_JS_NAMES = [
+      'despia', '_despia', 'despiaBridge', '__despiaBridgeDeliver', '__proto__', 'constructor', 'prototype'
+    ];
 
     function isPlainObject(value) {
       return Object.prototype.toString.call(value) === '[object Object]';
     }
 
-    function typeOf(value) {
-      if (value === null) return 'null';
-      if (Array.isArray(value)) return 'array';
-      if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
-      return typeof value;
+    // A name the app may read from window: a plain identifier, not one the
+    // runtime reserves.
+    function jsNameOK(name) {
+      return typeof name === 'string' && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name) &&
+        RESERVED_JS_NAMES.indexOf(name) === -1;
     }
 
-    function matchesType(expected, value) {
-      const actual = typeOf(value);
-      if (expected === 'number') return actual === 'number' || actual === 'integer';
-      return actual === expected;
+    function badArgs(where, message) {
+      return Promise.reject(new DespiaError(ErrorCodes.BAD_ARGS, where + ': ' + message));
     }
 
-    // Returns an error message, or null when args satisfy the spec.
-    function validateArgs(feature, action, params, args) {
-      const where = feature + '.' + action;
-      for (const name of Object.keys(params || {})) {
-        const spec = params[name];
-        const value = args[name];
-        if (value === undefined) {
-          if (spec.required) return where + ': "' + name + '" is required';
-          continue;
-        }
-        if (spec.type && !matchesType(spec.type, value)) {
-          return where + ': "' + name + '" must be ' + spec.type + ', got ' + typeOf(value);
-        }
-        if (typeof value === 'number' && !Number.isFinite(value)) {
-          return where + ': "' + name + '" must be finite';
-        }
-        const size = typeof value === 'number' ? value
-          : (typeof value === 'string' || Array.isArray(value)) ? value.length
-          : undefined;
-        const unit = typeof value === 'number' ? '' : ' in length';
-        if (size !== undefined && spec.min !== undefined && size < spec.min) {
-          return where + ': "' + name + '" must be at least ' + spec.min + unit;
-        }
-        if (size !== undefined && spec.max !== undefined && size > spec.max) {
-          return where + ': "' + name + '" must be at most ' + spec.max + unit;
-        }
+    function createApi({ catalog, bridge, hub, despiaFunction, observeVariable }) {
+      function listed(hello, feature, action) {
+        const entry = hello && hello.features && hello.features[feature];
+        return !!(entry && Array.isArray(entry.actions) && entry.actions.indexOf(action) !== -1);
       }
-      return null;
-    }
 
-    function fillTemplate(template, args) {
-      return template.replace(/\{([^}]+)\}/g, (_, name) => String(args[name]));
-    }
-
-    function buildLegacyCommand(legacy, args) {
-      const parts = [];
-      const query = legacy.query || {};
-      for (const key of Object.keys(query)) {
-        const value = args[query[key]];
-        if (value === undefined || value === null) continue;
-        const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
-        parts.push(key + '=' + encodeURIComponent(text));
-      }
-      return parts.length ? legacy.scheme + '?' + parts.join('&') : legacy.scheme;
-    }
-
-    function createApi({ features, transport, hub, despiaFunction }) {
-      function legacyCall(feature, action, legacy, args) {
-        const command = buildLegacyCommand(legacy, args);
-        const watch = (legacy.watch || []).map((name) => fillTemplate(name, args));
-        if (watch.length === 0) {
-          return despiaFunction(command).then(() => undefined);
-        }
-        return despiaFunction(command, watch).then((values) => {
-          values = values || {};
-          const missing = watch.filter((name) => values[name] === undefined);
-          if (missing.length) {
-            throw new DespiaError(
-              ErrorCodes.TIMEOUT,
-              feature + '.' + action + ': no reply in ' + missing.join(', ')
-            );
+      function startJob(state, feature, action, spec, args, callbacks, signal) {
+        hub.beginStart();
+        return bridge.request(state, feature, action, args, spec.timeoutMs, signal).then((value) => {
+          const id = value && typeof value === 'object' ? value.jobId : undefined;
+          if (typeof id !== 'string' || id === '') {
+            throw new DespiaError(ErrorCodes.INTERNAL, feature + '.' + action + ': reply has no jobId');
           }
-          return legacy.result ? values[fillTemplate(legacy.result, args)] : values;
+          const job = createJob({ hub, bridge, feature, action, id, callbacks });
+          hub.adopt(id);
+          return job;
+        }).then((job) => {
+          hub.endStart();
+          return job;
+        }, (err) => {
+          hub.endStart();
+          throw err;
         });
       }
 
-      function call(feature, action, spec, args) {
+      function invoke(feature, action, spec, args, callbacks, signal) {
+        const where = feature + '.' + action;
         if (args === undefined || args === null) args = {};
-        if (!isPlainObject(args)) {
-          return Promise.reject(new DespiaError(
-            ErrorCodes.INVALID_ARGS, feature + '.' + action + ': args must be a plain object'
-          ));
-        }
-        const problem = validateArgs(feature, action, spec.params, args);
-        if (problem) return Promise.reject(new DespiaError(ErrorCodes.INVALID_ARGS, problem));
+        if (!isPlainObject(args)) return badArgs(where, 'args must be a plain object');
+        const isJob = spec.kind === 'job';
 
-        const mode = transport.mode();
-        if (mode === 'ios' || mode === 'android') {
-          return transport.request(feature, action, args);
-        }
-        if (mode === 'legacy') {
-          if (!spec.legacy) {
-            return Promise.reject(new DespiaError(
-              ErrorCodes.UNSUPPORTED,
-              feature + '.' + action + ' needs a newer app build (no legacy scheme)'
-            ));
+        return bridge.detect().then((state) => {
+          if (!state.inApp) {
+            throw new DespiaError(ErrorCodes.NOT_IN_APP, where + ' is only available inside the Despia app');
           }
-          try {
-            return legacyCall(feature, action, spec.legacy, args);
-          } catch (e) {
-            return Promise.reject(new DespiaError(ErrorCodes.BRIDGE_ERROR, e && e.message));
+          if (listed(state.hello, feature, action)) {
+            return isJob
+              ? startJob(state, feature, action, spec, args, callbacks, signal)
+              : bridge.request(state, feature, action, args, spec.timeoutMs, signal);
+          }
+          if (!isJob && spec.legacy) return legacyCall(despiaFunction, feature, action, spec.legacy, args);
+          throw new DespiaError(
+            ErrorCodes.FEATURE_NOT_INSTALLED,
+            where + ' is not available in this app build'
+          );
+        });
+      }
+
+      function optionsOf(value) {
+        return isPlainObject(value) ? value : {};
+      }
+
+      function checkCallbacks(callbacks) {
+        if (callbacks === undefined || callbacks === null) return null;
+        if (!isPlainObject(callbacks)) return 'callbacks must be an object of functions';
+        const bad = Object.keys(callbacks).filter((name) => typeof callbacks[name] !== 'function');
+        return bad.length ? 'callback "' + bad[0] + '" is not a function' : null;
+      }
+
+      function checkListenOptions(opts) {
+        if (opts.since !== undefined) {
+          checkSince(opts.since);
+          if (opts.since !== 'all' && typeof opts.jobId !== 'string') {
+            throw new TypeError("Despia: a numeric since needs the jobId it counts for; use 'all' for every job");
           }
         }
-        return Promise.reject(new DespiaError(
-          ErrorCodes.NOT_IN_APP,
-          feature + '.' + action + ' is only available inside the Despia app'
-        ));
+        if (opts.jobId !== undefined && typeof opts.jobId !== 'string') {
+          throw new TypeError('Despia: jobId must be a string');
+        }
+      }
+
+      // Shared by despia.<feature>.on and despia.bridge.on.
+      function listen(feature, event, fn, opts) {
+        opts = optionsOf(opts);
+        checkListenOptions(opts);
+        const off = hub.on(feature, event, fn, { jobId: opts.jobId, since: opts.since });
+        const release = bridge.track(feature, event);
+        if (opts.since !== undefined) {
+          let since;
+          if (opts.since === 'all') since = opts.jobId ? { [opts.jobId]: 0 } : 'all';
+          else since = { [opts.jobId]: opts.since };
+          bridge.replay(feature, event, since);
+        }
+        return function stop() {
+          off();
+          release();
+        };
       }
 
       function createFeature(feature) {
-        const spec = features[feature];
+        const spec = catalog[feature];
         const ns = {};
         Object.keys(spec.actions).forEach((action) => {
           const actionSpec = spec.actions[action];
-          ns[action] = function (args) {
-            return call(feature, action, actionSpec, args);
-          };
+          if (actionSpec.kind === 'job') {
+            ns[action] = function (args, callbacks, opts) {
+              const problem = checkCallbacks(callbacks);
+              if (problem) return badArgs(feature + '.' + action, problem);
+              return invoke(feature, action, actionSpec, args, callbacks, optionsOf(opts).signal);
+            };
+          } else {
+            ns[action] = function (args, opts) {
+              return invoke(feature, action, actionSpec, args, null, optionsOf(opts).signal);
+            };
+          }
         });
-        ns.on = function (event, fn) {
-          return hub.on(feature, event, fn);
+        ns.on = function (event, fn, opts) {
+          return listen(feature, event, fn, opts);
         };
         return Object.freeze(ns);
       }
 
-      const namespaces = {};
-      Object.keys(features).forEach((feature) => {
-        namespaces[feature] = createFeature(feature);
+      const features = {};
+      Object.keys(catalog).forEach((feature) => {
+        if (SDK_WORDS.indexOf(feature) === -1) features[feature] = createFeature(feature);
       });
 
-      return { namespaces, validateArgs, buildLegacyCommand };
+      // despia.bridge: the built-in actions, plus the bridge's own events.
+      const builtins = {};
+      BRIDGE_ACTIONS.forEach((action) => {
+        builtins[action] = function (args) {
+          if (args !== undefined && args !== null && !isPlainObject(args)) {
+            return badArgs('bridge.' + action, 'args must be a plain object');
+          }
+          return bridge.builtin(action, args || {});
+        };
+      });
+      builtins.on = function (event, fn, opts) {
+        return listen('bridge', event, fn, opts);
+      };
+
+      const jobs = {
+        list(filter) {
+          return bridge.builtin('jobs', optionsOf(filter)).then((value) =>
+            (value && Array.isArray(value.jobs) ? value.jobs : []));
+        },
+        get(jobId) {
+          return bridge.builtin('job', { jobId });
+        },
+        cancel(jobId) {
+          return bridge.builtin('cancel', { jobId });
+        }
+      };
+
+      const legacy = {
+        // despia.legacy.variable(name)            -> window[name] now
+        // despia.legacy.variable(name, { wait })  -> resolves when it changes
+        variable(name, opts) {
+          if (!jsNameOK(name)) throw new TypeError('Despia: "' + String(name) + '" is not a valid window variable name');
+          if (opts && opts.wait === true) {
+            return new Promise((resolve) => {
+              const timeout = typeof opts.timeoutMs === 'number' ? opts.timeoutMs : undefined;
+              observeVariable(name, resolve, timeout);
+            });
+          }
+          return typeof window !== 'undefined' ? window[name] : undefined;
+        },
+        // Same as despia(command, watch).
+        call(command, watch) {
+          return despiaFunction(command, watch);
+        }
+      };
+
+      function onAny(fn) {
+        const off = hub.onAny(fn);
+        const release = bridge.track('*', null);
+        return function stop() {
+          off();
+          release();
+        };
+      }
+
+      return {
+        features,
+        words: {
+          legacy: Object.freeze(legacy),
+          on: onAny,
+          jobs: Object.freeze(jobs),
+          bridge: Object.freeze(builtins),
+          ready: () => bridge.ready()
+        },
+        jsNameOK
+      };
     }
 
-    module.exports = { createApi };
+    module.exports = { createApi, SDK_WORDS };
+  };
+
+  // ---- src/bridge.js ----
+  __modules['./bridge'] = function (module, exports, require) {
+    // The page side of the JSON bridge. The app injects one object,
+    // window.despiaBridge:
+    //
+    //   { v: 1, platform, call(feature, action, args?, opts?) -> Promise<Reply>, listen(fn) -> off }
+    //
+    // call() never rejects; it resolves with a reply envelope. listen() hands
+    // over every event packet this document receives. This module is the only
+    // place that touches that object.
+    //
+    // Detection happens once per document: the object must exist with v === 1,
+    // and `bridge.hello` must answer ok. Anything else means this document uses
+    // the legacy scheme calls only.
+
+    const { DespiaError, ErrorCodes } = require('./errors');
+
+    const DEFAULT_TIMEOUT_MS = 10000; // native's default for a request
+    const GUARD_MS = 5000;            // extra wait before the SDK gives up on a lost reply
+
+    function getWindow() {
+      return typeof window !== 'undefined' ? window : undefined;
+    }
+
+    function isObject(value) {
+      return value !== null && typeof value === 'object';
+    }
+
+    function readNative(win) {
+      try {
+        const native = win.despiaBridge;
+        if (isObject(native) && native.v === 1 &&
+            typeof native.call === 'function' && typeof native.listen === 'function') {
+          return native;
+        }
+      } catch (e) {
+        // a hostile getter: treat as absent
+      }
+      return null;
+    }
+
+    function isDespiaRuntime(win) {
+      const ua = win.navigator && win.navigator.userAgent;
+      return typeof ua === 'string' && ua.toLowerCase().indexOf('despia') !== -1;
+    }
+
+    // Turns a reply envelope into its value, or throws the DespiaError it carries.
+    function unwrap(reply) {
+      if (!isObject(reply) || typeof reply.ok !== 'boolean') {
+        throw new DespiaError(ErrorCodes.INTERNAL, 'Malformed reply from the native bridge');
+      }
+      if (reply.ok) return reply.value;
+      const err = isObject(reply.error) ? reply.error : {};
+      throw new DespiaError(
+        typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
+        typeof err.message === 'string' ? err.message : 'Native call failed',
+        typeof err.path === 'string' ? err.path : undefined
+      );
+    }
+
+    function cleanHello(value) {
+      if (!isObject(value) || !isObject(value.features)) return null;
+      const hello = Object.assign({}, value);
+      delete hello.cap; // never part of anything the SDK hands out
+      return hello;
+    }
+
+    // One native call, guarded: gives up at timeoutMs + 5000 and honours an
+    // AbortSignal by rejecting locally (native keeps running; its reply is dropped).
+    function guardedCall(native, feature, action, args, timeoutMs, signal) {
+      return new Promise((resolve, reject) => {
+        if (signal && signal.aborted) {
+          reject(new DespiaError(ErrorCodes.ABORTED, feature + '.' + action + ' was aborted'));
+          return;
+        }
+        let timer = null;
+        let onAbort = null;
+        let settled = false;
+        function finish(fn, value) {
+          if (settled) return;
+          settled = true;
+          if (timer !== null) clearTimeout(timer);
+          if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+          fn(value);
+        }
+        const limit = (timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : timeoutMs) + GUARD_MS;
+        timer = setTimeout(() => {
+          timer = null;
+          finish(reject, new DespiaError(ErrorCodes.TIMEOUT, feature + '.' + action + ': no reply in ' + limit + ' ms'));
+        }, limit);
+        if (timer && typeof timer.unref === 'function') timer.unref();
+        if (signal) {
+          onAbort = () => finish(reject, new DespiaError(ErrorCodes.ABORTED, feature + '.' + action + ' was aborted'));
+          signal.addEventListener('abort', onAbort);
+        }
+        let pending;
+        try {
+          pending = timeoutMs === undefined
+            ? native.call(feature, action, args)
+            : native.call(feature, action, args, { timeoutMs });
+        } catch (e) {
+          finish(reject, new DespiaError(ErrorCodes.INTERNAL, 'Bridge call failed: ' + (e && e.message)));
+          return;
+        }
+        Promise.resolve(pending).then(
+          (reply) => finish(resolve, reply),
+          (e) => finish(reject, new DespiaError(ErrorCodes.INTERNAL, 'Bridge call failed: ' + (e && e.message)))
+        );
+      });
+    }
+
+    function createBridge(hub) {
+      let memo = null;
+      const refs = new Map(); // subscription key -> listener count
+
+      function probe(win) {
+        const native = readNative(win);
+        const inApp = !!native || isDespiaRuntime(win);
+        const legacyOnly = { inApp, native, hello: null };
+        if (!native) return Promise.resolve(legacyOnly);
+        return guardedCall(native, 'bridge', 'hello', {}).then((reply) => {
+          let hello = null;
+          try {
+            hello = cleanHello(unwrap(reply));
+          } catch (e) {
+            hello = null; // refused (for example forbidden_origin)
+          }
+          if (!hello) return legacyOnly;
+          try {
+            native.listen(hub.intake);
+          } catch (e) {
+            console.error('Despia bridge listen failed:', e);
+          }
+          return { inApp: true, native, hello };
+        }, () => legacyOnly);
+      }
+
+      // Resolves with { inApp, native, hello }; hello is null for legacy-only
+      // documents. Settled once per document.
+      function detect() {
+        const win = getWindow();
+        if (!win) return Promise.resolve({ inApp: false, native: null, hello: null });
+        if (!memo) memo = probe(win);
+        return memo;
+      }
+
+      function ready() {
+        return detect().then((state) => (state.hello ? { bridge: true, hello: state.hello } : { bridge: false }));
+      }
+
+      // One request over the bridge: resolves with the reply value.
+      function request(state, feature, action, args, timeoutMs, signal) {
+        return guardedCall(state.native, feature, action, args, timeoutMs, signal).then(unwrap);
+      }
+
+      // A built-in `bridge` action. Goes straight to native when the object
+      // exists, so native's own refusal reaches the caller unchanged.
+      function builtin(action, args, signal) {
+        return detect().then((state) => {
+          if (!state.native) {
+            throw new DespiaError(
+              state.inApp ? ErrorCodes.FEATURE_NOT_INSTALLED : ErrorCodes.NOT_IN_APP,
+              'bridge.' + action + (state.inApp
+                ? ': this app build has no JSON bridge'
+                : ' is only available inside the Despia app')
+            );
+          }
+          return request(state, 'bridge', action, args || {}, undefined, signal).then((value) => {
+            if (action === 'hello') return cleanHello(value) || value;
+            return value;
+          });
+        });
+      }
+
+      // Best effort: a failed (un)subscribe never surfaces.
+      function send(action, args) {
+        detect().then((state) => {
+          if (state.hello) return guardedCall(state.native, 'bridge', action, args);
+        }).then(null, () => {});
+      }
+
+      // Counts listeners per feature/event so native hears one subscribe when
+      // the first listener arrives and one unsubscribe when the last one leaves.
+      // `feature` may be '*'; `event` may be null for the whole feature.
+      function track(feature, event) {
+        const key = feature + '\u0000' + (event || '');
+        const args = event ? { feature, events: [event] } : { feature };
+        const count = (refs.get(key) || 0) + 1;
+        refs.set(key, count);
+        if (count === 1) send('subscribe', args);
+        let released = false;
+        return function release() {
+          if (released) return;
+          released = true;
+          const left = refs.get(key) - 1;
+          if (left > 0) {
+            refs.set(key, left);
+          } else {
+            refs.delete(key);
+            send('unsubscribe', args);
+          }
+        };
+      }
+
+      // Asks native to replay stored events: since is { <jobId>: seq } or 'all'.
+      function replay(feature, event, since) {
+        send('subscribe', { feature, events: [event], since });
+      }
+
+      return { detect, ready, request, builtin, track, replay };
+    }
+
+    module.exports = { createBridge, unwrap, DEFAULT_TIMEOUT_MS, GUARD_MS };
   };
 
   // ---- src/errors.js ----
   __modules['./errors'] = function (module, exports, require) {
-    // Error type for every rejection of the new `despia.<feature>.<action>()` API.
-    // Native error codes pass through unchanged; the SDK adds the codes below.
+    // Error type for every rejection of the typed `despia.<feature>.<action>()`
+    // API. Codes that native sends pass through unchanged; the codes below are
+    // the ones the SDK itself produces.
 
     const ErrorCodes = Object.freeze({
-      NOT_IN_APP: 'not_in_app',     // plain browser: no JSON bridge and no Despia runtime
-      UNSUPPORTED: 'unsupported',   // no JSON bridge and the action has no legacy scheme
-      INVALID_ARGS: 'invalid_args', // args failed validation or are not JSON-serialisable
-      TIMEOUT: 'timeout',           // legacy fallback: the result variable never arrived
-      BRIDGE_ERROR: 'bridge_error', // transport failure or malformed reply
-      NATIVE_ERROR: 'native_error'  // native rejected without a structured error
+      NOT_IN_APP: 'not_in_app',                       // plain browser: no Despia runtime at all
+      ABORTED: 'aborted',                             // the caller's AbortSignal fired
+      TIMEOUT: 'timeout',                             // no reply inside timeoutMs + 5000
+      FEATURE_NOT_INSTALLED: 'feature_not_installed', // this app build has no bridge route for it
+      BAD_ARGS: 'bad_args',                           // args were not a plain object
+      INTERNAL: 'internal'                            // malformed reply or transport fault
     });
 
     class DespiaError extends Error {
-      constructor(code, message, details) {
+      constructor(code, message, path) {
         super(message || String(code));
         this.name = 'DespiaError';
         this.code = String(code);
-        if (details !== undefined) this.details = details;
+        if (path !== undefined) this.path = path;
       }
     }
 
@@ -198,12 +496,26 @@
 
   // ---- src/events.js ----
   __modules['./events'] = function (module, exports, require) {
-    // In-page event hub. The transport feeds it `{ feature, event, data }`;
-    // pages subscribe per feature/event or to everything (broadcast).
+    // In-page event hub. The bridge feeds it every packet the page receives;
+    // the hub puts each job's packets in `seq` order, holds early packets for
+    // jobs whose start reply has not been processed yet, and fans out to
+    // broadcast listeners, feature listeners and job listeners.
+
+    const REORDER_MS = 50;      // how long a live packet waits for a missing lower seq
+    const MAX_EARLY = 1000;     // packets held for jobs not yet adopted
+    const MAX_JOB_STATES = 512; // jobs whose ordering state is kept
+
+    function isObject(value) {
+      return value !== null && typeof value === 'object';
+    }
 
     function createEventHub() {
-      const byKey = new Map(); // "feature\u0000event" -> Set of subscription records
+      const byKey = new Map();   // "feature\0event" -> Set of listener records
       const broadcast = new Set();
+      const states = new Map();  // jobId -> { last, held, timer }
+      const early = new Map();   // jobId -> packets that arrived before adopt()
+      let earlyCount = 0;
+      let starting = 0;
 
       function assertListener(fn) {
         if (typeof fn !== 'function') throw new TypeError('Despia: listener must be a function');
@@ -220,15 +532,19 @@
         };
       }
 
-      function on(feature, event, fn) {
+      // opts: { jobId, since }. A listener that passes `since` also receives the
+      // packets native replays from its durable log (replay: true).
+      function on(feature, event, fn, opts) {
         assertListener(fn);
         if (typeof event !== 'string' || event === '') {
           throw new TypeError('Despia: event name must be a non-empty string');
         }
+        opts = opts || {};
         const key = feature + '\u0000' + event;
         let set = byKey.get(key);
         if (!set) byKey.set(key, (set = new Set()));
-        return subscribe(set, { fn }, () => {
+        const record = { fn, jobId: opts.jobId, since: opts.since };
+        return subscribe(set, record, () => {
           if (set.size === 0 && byKey.get(key) === set) byKey.delete(key);
         });
       }
@@ -246,17 +562,146 @@
         }
       }
 
-      function dispatch(feature, event, data) {
-        const set = byKey.get(feature + '\u0000' + event);
-        // Snapshot so listeners may unsubscribe while being called.
-        if (set) Array.from(set).forEach((record) => call(record.fn, data));
-        if (broadcast.size) {
-          const payload = { feature, event, data };
-          Array.from(broadcast).forEach((record) => call(record.fn, payload));
+      function accepts(record, packet) {
+        if (record.jobId !== undefined && packet.jobId !== record.jobId) return false;
+        if (packet.replay) {
+          if (record.since === undefined) return false;
+          if (typeof record.since === 'number' && typeof packet.seq === 'number' && packet.seq <= record.since) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function dispatch(packet) {
+        // Snapshots, so listeners may unsubscribe while being called.
+        if (broadcast.size) Array.from(broadcast).forEach((record) => call(record.fn, packet));
+        const set = byKey.get(packet.feature + '\u0000' + packet.event);
+        if (set) {
+          Array.from(set).forEach((record) => {
+            if (accepts(record, packet)) call(record.fn, packet.data);
+          });
         }
       }
 
-      return { on, onAny, dispatch };
+      function stateOf(jobId) {
+        let state = states.get(jobId);
+        if (state) {
+          states.delete(jobId); // refresh recency
+        } else {
+          state = { last: undefined, held: new Map(), timer: null, adopted: false };
+          if (states.size >= MAX_JOB_STATES) {
+            const oldest = states.keys().next().value;
+            const dropped = states.get(oldest);
+            if (dropped.timer) clearTimeout(dropped.timer);
+            states.delete(oldest);
+          }
+        }
+        states.set(jobId, state);
+        return state;
+      }
+
+      function deliver(state, packet) {
+        state.last = packet.seq;
+        dispatch(packet);
+      }
+
+      function drain(state) {
+        while (state.held.has(state.last + 1)) {
+          const next = state.held.get(state.last + 1);
+          state.held.delete(next.seq);
+          deliver(state, next);
+        }
+        if (state.held.size === 0 && state.timer) {
+          clearTimeout(state.timer);
+          state.timer = null;
+        }
+      }
+
+      function flushHeld(state) {
+        state.timer = null;
+        const packets = Array.from(state.held.values()).sort((a, b) => a.seq - b.seq);
+        state.held.clear();
+        packets.forEach((packet) => {
+          if (packet.seq > state.last) deliver(state, packet);
+        });
+      }
+
+      function sequence(jobId, packet) {
+        // Replays come from the durable log already in order, and may skip
+        // numbers by design (only the latest progress is kept).
+        if (packet.replay || typeof packet.seq !== 'number') {
+          dispatch(packet);
+          return;
+        }
+        const state = stateOf(jobId);
+        if (state.last !== undefined && packet.seq <= state.last) return; // already delivered
+        if (state.last === undefined || packet.seq === state.last + 1) {
+          deliver(state, packet);
+          drain(state);
+          return;
+        }
+        state.held.set(packet.seq, packet);
+        if (!state.timer) {
+          state.timer = setTimeout(() => flushHeld(state), REORDER_MS);
+          if (state.timer && typeof state.timer.unref === 'function') state.timer.unref();
+        }
+      }
+
+      function hold(jobId, packet) {
+        let list = early.get(jobId);
+        if (!list) early.set(jobId, (list = []));
+        if (earlyCount >= MAX_EARLY) return;
+        list.push(packet);
+        earlyCount++;
+      }
+
+      function release(jobId) {
+        const list = early.get(jobId) || [];
+        early.delete(jobId);
+        earlyCount -= list.length;
+        list.sort((a, b) => (a.seq || 0) - (b.seq || 0)).forEach((packet) => sequence(jobId, packet));
+      }
+
+      // Called with every packet native delivers.
+      function intake(raw) {
+        if (!isObject(raw) || typeof raw.feature !== 'string' || typeof raw.event !== 'string') return;
+        const packet = isObject(raw.data) ? raw : Object.assign({}, raw, { data: {} });
+        const jobId = typeof packet.jobId === 'string' ? packet.jobId : undefined;
+        if (jobId === undefined) {
+          dispatch(packet);
+          return;
+        }
+        const state = states.get(jobId);
+        if (starting > 0 && !(state && state.adopted)) {
+          hold(jobId, packet);
+          return;
+        }
+        sequence(jobId, packet);
+      }
+
+      // A job-start request is in flight: packets for jobs nobody owns yet are
+      // held, because the reply that names the job may be processed after them.
+      function beginStart() {
+        starting++;
+      }
+
+      // The start reply named `jobId` and its listeners are attached.
+      function adopt(jobId) {
+        const state = stateOf(jobId);
+        state.adopted = true;
+        state.last = 0;
+        release(jobId);
+      }
+
+      function endStart() {
+        starting = Math.max(0, starting - 1);
+        if (starting > 0) return;
+        // Whatever nobody claimed is ordinary traffic: deliver it.
+        Array.from(early.keys()).forEach(release);
+      }
+
+      return { on, onAny, intake, beginStart, adopt, endStart };
     }
 
     module.exports = { createEventHub };
@@ -264,132 +709,315 @@
 
   // ---- src/features.js ----
   __modules['./features'] = function (module, exports, require) {
-    // Runtime feature map: actions, their parameters and the legacy scheme each
-    // one falls back to when the JSON bridge is not present. The type-level twin
-    // of this table is features.d.ts.
-    //
-    // Hand-written for now. scripts/generate-features.js emits this exact shape
-    // from native routes.json files and will replace this file.
-    //
-    // action = {
-    //   params: { name: { type, required?, min?, max? } },  // validated before sending
-    //   legacy: {                                           // omitted = no fallback
-    //     scheme: 'scheme://route',
-    //     query:  { queryKey: 'paramName' },                // appended as ?queryKey=value
-    //     watch:  ['windowVar' | '{paramName}'],            // variables the app writes back
-    //     result: 'windowVar' | '{paramName}'               // resolve with one variable;
-    //   }                                                   // omitted = object of all watched
-    // }
+    // Runtime feature table. Generated by scripts/generate-features.js from
+    // bridge-catalog.json. Do not edit; see features.d.ts for the types.
 
     module.exports = {
-      haptics: {
-        actions: {
-          light: { params: {}, legacy: { scheme: 'lighthaptic://' } },
-          heavy: { params: {}, legacy: { scheme: 'heavyhaptic://' } },
-          success: { params: {}, legacy: { scheme: 'successhaptic://' } },
-          warning: { params: {}, legacy: { scheme: 'warninghaptic://' } },
-          error: { params: {}, legacy: { scheme: 'errorhaptic://' } }
-        },
-        events: []
-      },
-
-      vault: {
-        actions: {
-          set: {
-            params: {
-              key: { type: 'string', required: true, min: 1 },
-              value: { type: 'string', required: true },
-              locked: { type: 'boolean' }
-            },
-            legacy: {
-              scheme: 'setvault://',
-              query: { key: 'key', value: 'value', locked: 'locked' }
+      "haptics": {
+        "actions": {
+          "light": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "lighthaptic",
+              "args": [],
+              "answer": "none"
             }
           },
-          get: {
-            params: {
-              key: { type: 'string', required: true, min: 1 }
-            },
-            legacy: {
-              scheme: 'readvault://',
-              query: { key: 'key' },
-              watch: ['{key}'],
-              result: '{key}'
+          "heavy": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "heavyhaptic",
+              "args": [],
+              "answer": "none"
+            }
+          },
+          "success": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "successhaptic",
+              "args": [],
+              "answer": "none"
+            }
+          },
+          "warning": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "warninghaptic",
+              "args": [],
+              "answer": "none"
+            }
+          },
+          "error": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "errorhaptic",
+              "args": [],
+              "answer": "none"
             }
           }
         },
-        events: []
+        "events": []
       },
-
-      device: {
-        actions: {
-          appVersion: {
-            params: {},
-            legacy: { scheme: 'getappversion://', watch: ['versionNumber', 'bundleNumber'] }
-          },
-          uuid: {
-            params: {},
-            legacy: { scheme: 'get-uuid://', watch: ['uuid'], result: 'uuid' }
-          },
-          storeLocation: {
-            params: {},
-            legacy: { scheme: 'getstorelocation://', watch: ['storeLocation'], result: 'storeLocation' }
-          }
-        },
-        events: []
-      },
-
-      revenuecat: {
-        actions: {
-          purchase: {
-            params: {
-              externalId: { type: 'string', required: true, min: 1 },
-              product: { type: 'string', required: true, min: 1 }
-            },
-            legacy: {
-              scheme: 'revenuecat://purchase',
-              query: { external_id: 'externalId', product: 'product' }
+      "vault": {
+        "actions": {
+          "set": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "setvault",
+              "args": [
+                {
+                  "arg": "key",
+                  "name": "key",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "value",
+                  "name": "value",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "locked",
+                  "name": "locked",
+                  "encoding": "plain"
+                }
+              ],
+              "answer": "none"
             }
           },
-          paywall: {
-            params: {
-              externalId: { type: 'string', required: true, min: 1 },
-              offering: { type: 'string', min: 1 }
-            },
-            legacy: {
-              scheme: 'revenuecat://launchPaywall',
-              query: { external_id: 'externalId', offering: 'offering' }
+          "get": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "readvault",
+              "args": [
+                {
+                  "arg": "key",
+                  "name": "key",
+                  "encoding": "plain"
+                }
+              ],
+              "variable": "{key}",
+              "answer": "variable"
             }
-          },
-          history: {
-            params: {},
-            legacy: { scheme: 'getpurchasehistory://', watch: ['restoredData'], result: 'restoredData' }
           }
         },
-        events: ['purchase']
+        "events": []
       },
-
-      gps: {
-        actions: {
-          start: {
-            params: {
-              buffer: { type: 'integer', min: 1 },
-              movement: { type: 'integer', min: 0 },
-              server: { type: 'string', min: 1 }
-            },
-            legacy: {
-              scheme: 'location://',
-              query: { buffer: 'buffer', movement: 'movement', server: 'server' }
+      "device": {
+        "actions": {
+          "app_version": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "getappversion",
+              "args": [],
+              "variable": [
+                "versionNumber",
+                "bundleNumber"
+              ],
+              "answer": "variable"
             }
           },
-          stop: {
-            params: {},
-            legacy: { scheme: 'stoplocation://', watch: ['locationSession'], result: 'locationSession' }
+          "uuid": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "get-uuid",
+              "args": [],
+              "variable": "uuid",
+              "answer": "variable"
+            }
+          },
+          "store_location": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "getstorelocation",
+              "args": [],
+              "variable": "storeLocation",
+              "answer": "variable"
+            }
           }
         },
-        events: ['change']
+        "events": []
+      },
+      "revenuecat": {
+        "actions": {
+          "purchase": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "revenuecat",
+              "host": "purchase",
+              "args": [
+                {
+                  "arg": "externalId",
+                  "name": "external_id",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "product",
+                  "name": "product",
+                  "encoding": "plain"
+                }
+              ],
+              "answer": "none"
+            }
+          },
+          "paywall": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "revenuecat",
+              "host": "launchPaywall",
+              "args": [
+                {
+                  "arg": "externalId",
+                  "name": "external_id",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "offering",
+                  "name": "offering",
+                  "encoding": "plain"
+                }
+              ],
+              "answer": "none"
+            }
+          },
+          "history": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "getpurchasehistory",
+              "args": [],
+              "variable": "restoredData",
+              "answer": "variable"
+            }
+          }
+        },
+        "events": [
+          "purchase"
+        ]
+      },
+      "gps": {
+        "actions": {
+          "start": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "location",
+              "args": [
+                {
+                  "arg": "buffer",
+                  "name": "buffer",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "movement",
+                  "name": "movement",
+                  "encoding": "plain"
+                },
+                {
+                  "arg": "server",
+                  "name": "server",
+                  "encoding": "plain"
+                }
+              ],
+              "answer": "none"
+            }
+          },
+          "stop": {
+            "kind": "request",
+            "legacy": {
+              "scheme": "stoplocation",
+              "args": [],
+              "variable": "locationSession",
+              "answer": "variable"
+            }
+          }
+        },
+        "events": [
+          "change"
+        ]
       }
     };
+  };
+
+  // ---- src/jobs.js ----
+  __modules['./jobs'] = function (module, exports, require) {
+    // A Job is the handle for one long-running action. Native answers the start
+    // request with { jobId }; everything after that arrives as events carrying
+    // that jobId.
+
+    const { DespiaError, ErrorCodes } = require('./errors');
+
+    function checkSince(since) {
+      if (since === 'all' || (Number.isInteger(since) && since >= 0)) return;
+      throw new TypeError("Despia: since must be a non-negative integer or 'all'");
+    }
+
+    function errorFrom(done) {
+      const err = done && done.error && typeof done.error === 'object' ? done.error : {};
+      return new DespiaError(
+        typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
+        typeof err.message === 'string' ? err.message : 'Job failed',
+        typeof err.path === 'string' ? err.path : undefined
+      );
+    }
+
+    function createJob({ hub, bridge, feature, action, id, callbacks }) {
+      let finished = null;
+      const waiters = [];
+
+      // Tracks the terminal event. Replayed copies count too.
+      hub.on(feature, 'done', (done) => {
+        if (finished) return;
+        finished = done;
+        waiters.splice(0).forEach((settle) => settle(done));
+      }, { jobId: id, since: 'all' });
+
+      function on(event, fn, opts) {
+        if (typeof event !== 'string' || event === '') {
+          throw new TypeError('Despia: event name must be a non-empty string');
+        }
+        if (typeof fn !== 'function') throw new TypeError('Despia: listener must be a function');
+        opts = opts || {};
+        let handler = fn;
+        let name = event;
+        if (event === 'error') {
+          // Sugar: `error` is a `done` that did not succeed.
+          name = 'done';
+          handler = (done) => {
+            if (done && done.ok === true) return;
+            const err = done && done.error && typeof done.error === 'object' ? done.error : {};
+            fn(Object.assign({ code: ErrorCodes.INTERNAL, message: 'Job failed' }, err, { jobId: id }));
+          };
+        }
+        if (opts.since !== undefined) {
+          checkSince(opts.since);
+          bridge.replay(feature, name, { [id]: opts.since === 'all' ? 0 : opts.since });
+        }
+        return hub.on(feature, name, handler, { jobId: id, since: opts.since });
+      }
+
+      function result() {
+        return new Promise((resolve, reject) => {
+          const settle = (done) => (done && done.ok === true ? resolve(done) : reject(errorFrom(done)));
+          if (finished) settle(finished);
+          else waiters.push(settle);
+        });
+      }
+
+      function cancel() {
+        return bridge.builtin('cancel', { jobId: id });
+      }
+
+      function ack(seq) {
+        if (!Number.isInteger(seq) || seq < 0) {
+          return Promise.reject(new DespiaError(ErrorCodes.BAD_ARGS, 'ack: seq must be a non-negative integer'));
+        }
+        return bridge.builtin('ack', { jobId: id, seq }).then(() => undefined);
+      }
+
+      const job = Object.freeze({ id, feature, action, on, result, cancel, ack });
+      Object.keys(callbacks || {}).forEach((event) => on(event, callbacks[event]));
+      return job;
+    }
+
+    module.exports = { createJob, checkSince };
   };
 
   // ---- src/legacy.js ----
@@ -590,261 +1218,102 @@
           return observeVariables(watch);
         }
 
-    module.exports = { despiaFunction };
+    module.exports = { despiaFunction, observeDespiaVariable };
   };
 
-  // ---- src/transport.js ----
-  __modules['./transport'] = function (module, exports, require) {
-    // JSON bridge transport. This file is the whole wire contract; if the
-    // contract changes, this is the only module that should need to.
+  // ---- src/legacycall.js ----
+  __modules['./legacycall'] = function (module, exports, require) {
+    // Fallback for a document without the JSON bridge: the typed call becomes
+    // the scheme URL the SDK has always sent, `despia(command, watch)`.
     //
-    //   page -> native   { v: 1, id, feature, action, args }
-    //     iOS      await window.webkit.messageHandlers.despia.postMessage(msg)
-    //              (WKScriptMessageHandlerWithReply; the promise resolves with the reply)
-    //     Android  window.despia_bridge.postMessage(JSON.stringify(msg))
-    //              (androidx.webkit addWebMessageListener; reply arrives as a message, matched by id)
-    //
-    //   native -> page reply   { id, ok: true, value } | { id, ok: false, error: { code, message } }
-    //   native -> page event   window.__despia.emit({ feature, event, data })
-    //                          (Android may also post the event object over despia_bridge)
-    //
-    // With neither bridge present, mode() reports 'legacy' inside the Despia
-    // runtime (user agent contains "despia") and 'none' in a plain browser.
+    // Catalog mapping of one action:
+    //   legacy: {
+    //     scheme, host?, route?,              // scheme://host/route
+    //     args: [{ arg, name, encoding }],    // query parameters, in order
+    //     variable?,                          // window variable(s) the app answers in
+    //     answer: 'none' | 'variable' | 'envelope'
+    //   }
+    // `variable` may be a name, a list of names, and may hold {argName} templates.
 
     const { DespiaError, ErrorCodes } = require('./errors');
 
-    const PROTOCOL_VERSION = 1;
-    const IOS_HANDLER = 'despia';
-    const ANDROID_OBJECT = 'despia_bridge';
-    const EMIT_HOOK = '__despia';
-
-    function getWindow() {
-      return typeof window !== 'undefined' ? window : undefined;
+    function fillTemplate(template, args) {
+      return template.replace(/\{([^}]+)\}/g, (_, name) => String(args[name]));
     }
 
-    function iosHandler(win) {
-      try {
-        const handlers = win.webkit && win.webkit.messageHandlers;
-        const handler = handlers && handlers[IOS_HANDLER];
-        return handler && typeof handler.postMessage === 'function' ? handler : null;
-      } catch (e) {
-        return null;
-      }
+    function buildCommand(legacy, args) {
+      let command = legacy.scheme + '://' + (legacy.host || '') + (legacy.route ? '/' + legacy.route : '');
+      const parts = [];
+      (legacy.args || []).forEach((entry) => {
+        const value = args[entry.arg];
+        if (value === undefined || value === null) return;
+        const text = entry.encoding === 'json' ? JSON.stringify(value) : String(value);
+        parts.push(entry.name + '=' + encodeURIComponent(text));
+      });
+      if (parts.length) command += '?' + parts.join('&');
+      return command;
     }
 
-    function androidBridge(win) {
-      try {
-        const bridge = win[ANDROID_OBJECT];
-        return bridge && typeof bridge.postMessage === 'function' ? bridge : null;
-      } catch (e) {
-        return null;
-      }
+    function watchList(legacy, args) {
+      return [].concat(legacy.variable || []).map((name) => fillTemplate(name, args));
     }
 
-    function isDespiaRuntime(win) {
-      const ua = win.navigator && win.navigator.userAgent;
-      return typeof ua === 'string' && ua.toLowerCase().indexOf('despia') !== -1;
+    // The app's answer envelope: { ok: true, data } or { ok: false, error: { code, message } }.
+    function unwrapEnvelope(value) {
+      if (value === null || typeof value !== 'object' || typeof value.ok !== 'boolean') return value;
+      if (value.ok) return value.data;
+      const err = value.error && typeof value.error === 'object' ? value.error : {};
+      throw new DespiaError(
+        typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
+        typeof err.message === 'string' ? err.message : 'Native call failed'
+      );
     }
 
-    function parseMaybeJson(value) {
-      if (typeof value !== 'string') return value;
-      try {
-        return JSON.parse(value);
-      } catch (e) {
-        return undefined;
-      }
-    }
+    function legacyCall(despiaFunction, feature, action, legacy, args) {
+      const command = buildCommand(legacy, args);
+      const watch = legacy.answer === 'none' ? [] : watchList(legacy, args);
+      if (watch.length === 0) return despiaFunction(command).then(() => undefined);
 
-    function isObject(value) {
-      return value !== null && typeof value === 'object';
-    }
-
-    function isEvent(msg) {
-      return isObject(msg) && typeof msg.feature === 'string' && typeof msg.event === 'string';
-    }
-
-    function isReply(msg) {
-      return isObject(msg) && typeof msg.id === 'string' && typeof msg.ok === 'boolean';
-    }
-
-    function settle(reply, resolve, reject) {
-      if (reply.ok) {
-        resolve(reply.value);
-        return;
-      }
-      const err = isObject(reply.error) ? reply.error : {};
-      reject(new DespiaError(
-        err.code || ErrorCodes.NATIVE_ERROR,
-        err.message || 'Native call failed',
-        err.details
-      ));
-    }
-
-    function randomPrefix() {
-      return Math.random().toString(36).slice(2, 8) + Date.now().toString(36);
-    }
-
-    function createTransport() {
-      const prefix = randomPrefix();
-      const pending = new Map(); // id -> { resolve, reject } (Android only)
-      let seq = 0;
-      let eventSink = null;
-      let androidAttached = null;
-
-      function mode() {
-        const win = getWindow();
-        if (!win) return 'none';
-        if (iosHandler(win)) return 'ios';
-        if (androidBridge(win)) return 'android';
-        if (isDespiaRuntime(win)) return 'legacy';
-        return 'none';
-      }
-
-      function deliverEvent(msg) {
-        if (eventSink) eventSink(msg.feature, msg.event, msg.data);
-      }
-
-      function onAndroidMessage(evt) {
-        const msg = parseMaybeJson(evt && evt.data !== undefined ? evt.data : evt);
-        if (isReply(msg)) {
-          const entry = pending.get(msg.id);
-          if (!entry) return; // another SDK copy on the page, or a late reply
-          pending.delete(msg.id);
-          settle(msg, entry.resolve, entry.reject);
-        } else if (isEvent(msg)) {
-          deliverEvent(msg);
+      return despiaFunction(command, watch).then((values) => {
+        values = values || {};
+        const missing = watch.filter((name) => values[name] === undefined);
+        if (missing.length) {
+          throw new DespiaError(
+            ErrorCodes.TIMEOUT,
+            feature + '.' + action + ': no reply in ' + missing.join(', ')
+          );
         }
-      }
-
-      function attachAndroid(bridge) {
-        if (androidAttached === bridge) return;
-        androidAttached = bridge;
-        if (typeof bridge.addEventListener === 'function') {
-          bridge.addEventListener('message', onAndroidMessage);
-        } else {
-          const previous = bridge.onmessage;
-          bridge.onmessage = function (evt) {
-            onAndroidMessage(evt);
-            if (typeof previous === 'function') previous.call(this, evt);
-          };
-        }
-      }
-
-      // Native calls window.__despia.emit(payload). Several SDK copies on one page
-      // share the hook, so each registers a sink instead of replacing it.
-      function installEmitHook(win) {
-        let hook = win[EMIT_HOOK];
-        if (!isObject(hook) || typeof hook.emit !== 'function' || !Array.isArray(hook.sinks)) {
-          const sinks = [];
-          hook = {
-            v: PROTOCOL_VERSION,
-            sinks,
-            emit(payload) {
-              const msg = parseMaybeJson(payload);
-              if (!isEvent(msg)) return false;
-              sinks.slice().forEach((sink) => sink(msg));
-              return true;
-            }
-          };
-          win[EMIT_HOOK] = hook;
-        }
-        hook.sinks.push(deliverEvent);
-      }
-
-      function install(sink) {
-        eventSink = sink;
-        const win = getWindow();
-        if (!win) return;
-        try {
-          installEmitHook(win);
-          const bridge = androidBridge(win);
-          if (bridge) attachAndroid(bridge);
-        } catch (e) {
-          console.error('Despia bridge setup failed:', e);
-        }
-      }
-
-      // Sends one request over the JSON bridge. Resolves with reply.value,
-      // rejects with DespiaError. Call only when mode() is 'ios' or 'android'.
-      function request(feature, action, args) {
-        return new Promise((resolve, reject) => {
-          const win = getWindow();
-          const id = prefix + '-' + (++seq);
-          let json;
-          try {
-            json = JSON.stringify({ v: PROTOCOL_VERSION, id, feature, action, args });
-          } catch (e) {
-            reject(new DespiaError(ErrorCodes.INVALID_ARGS, 'Arguments are not JSON-serialisable: ' + e.message));
-            return;
-          }
-
-          const ios = win && iosHandler(win);
-          if (ios) {
-            let result;
-            try {
-              // Send a plain JSON copy so both platforms see identical data.
-              result = ios.postMessage(JSON.parse(json));
-            } catch (e) {
-              reject(new DespiaError(ErrorCodes.BRIDGE_ERROR, 'postMessage failed: ' + (e && e.message)));
-              return;
-            }
-            Promise.resolve(result).then((raw) => {
-              const reply = parseMaybeJson(raw);
-              if (!isReply(reply) || reply.id !== id) {
-                reject(new DespiaError(ErrorCodes.BRIDGE_ERROR, 'Malformed reply from native bridge', raw));
-                return;
-              }
-              settle(reply, resolve, reject);
-            }, (e) => {
-              // replyHandler(nil, errorMessage) rejects with a plain Error.
-              reject(new DespiaError(ErrorCodes.NATIVE_ERROR, (e && e.message) || String(e)));
-            });
-            return;
-          }
-
-          const android = win && androidBridge(win);
-          if (android) {
-            attachAndroid(android);
-            pending.set(id, { resolve, reject });
-            try {
-              android.postMessage(json);
-            } catch (e) {
-              pending.delete(id);
-              reject(new DespiaError(ErrorCodes.BRIDGE_ERROR, 'postMessage failed: ' + (e && e.message)));
-            }
-            return;
-          }
-
-          reject(new DespiaError(ErrorCodes.BRIDGE_ERROR, 'JSON bridge is not available'));
-        });
-      }
-
-      return { mode, install, request };
+        const value = Array.isArray(legacy.variable) ? values : values[watch[0]];
+        return legacy.answer === 'envelope' ? unwrapEnvelope(value) : value;
+      });
     }
 
-    module.exports = { createTransport, PROTOCOL_VERSION };
+    module.exports = { legacyCall, buildCommand };
   };
 
   // ---- src/index.js ----
   __modules['./index'] = function (module, exports, require) {
-    const { despiaFunction } = require('./legacy');
+    const { despiaFunction, observeDespiaVariable } = require('./legacy');
     const { DespiaError } = require('./errors');
     const { createEventHub } = require('./events');
-    const { createTransport } = require('./transport');
+    const { createBridge } = require('./bridge');
     const { createApi } = require('./api');
-    const features = require('./features');
+    const catalog = require('./features');
+
+    const LIMITS = Object.freeze({
+      maxMessageBytes: 4194304,
+      maxDepth: 32,
+      maxNodes: 100000,
+      maxKeyLength: 128,
+      maxInFlight: 64,
+      maxPerSecond: 200,
+      newStringMaxBytes: 262144
+    });
 
     const hub = createEventHub();
-    const transport = createTransport();
-    transport.install(hub.dispatch);
-
-    const api = createApi({ features, transport, hub, despiaFunction });
-
-    const legacy = Object.freeze({
-      // Reads a variable the app injected the old way (window[name]).
-      variable(name) {
-        return typeof window !== 'undefined' ? window[name] : undefined;
-      }
+    const bridge = createBridge(hub);
+    const api = createApi({
+      catalog, bridge, hub, despiaFunction, observeVariable: observeDespiaVariable
     });
 
     // New members are non-enumerable so the function object looks as it did.
@@ -854,12 +1323,12 @@
       });
     }
 
-    Object.keys(api.namespaces).forEach((name) => define(name, api.namespaces[name]));
-    define('on', function on(listener) {
-      return hub.onAny(listener);
-    });
-    define('legacy', legacy);
+    // Resolution order for despia.<x>: the SDK's own words, then a catalog
+    // feature, then (in the proxy below) the old window pass-through.
+    Object.keys(api.words).forEach((name) => define(name, api.words[name]));
+    Object.keys(api.features).forEach((name) => define(name, api.features[name]));
     define('DespiaError', DespiaError);
+    define('LIMITS', LIMITS);
 
         // Create proxy for window access
         const despia = new Proxy(despiaFunction, {

@@ -36,7 +36,7 @@
     "scripts": {
         "build": "node scripts/build.js",
         "generate": "node scripts/generate-features.js",
-        "test": "node scripts/build.js --check && node --test \"test/*.test.js\" && tsc -p test/types",
+        "test": "node scripts/generate-features.js --check && node scripts/build.js --check && node --test \"test/*.test.js\" && tsc -p test/types",
         "prepublishOnly": "npm test"
     },
     "files": [

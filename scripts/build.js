@@ -24,10 +24,12 @@ function indent(text, pad) {
   return text.split('\n').map((line) => (line.length ? pad + line : line)).join('\n');
 }
 
-function build() {
+// overrides: { <module id>: source text } replaces a module (tests use it to
+// bundle a different feature table).
+function build(overrides = {}) {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const modules = moduleIds().map((id) => {
-    const source = fs.readFileSync(path.join(SRC, id + '.js'), 'utf8')
+    const source = (overrides[id] !== undefined ? overrides[id] : fs.readFileSync(path.join(SRC, id + '.js'), 'utf8'))
       .replace(/^'use strict';\n+/, '')
       .replace(/\s+$/, '');
     return [

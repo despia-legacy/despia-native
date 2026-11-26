@@ -1,62 +1,151 @@
 #!/usr/bin/env node
 'use strict';
 
-// Generator hook: builds the feature map from native routes.json files.
+// Generator: turns a bridge catalog into the typed feature map and the
+// runtime table the SDK ships.
 //
-//   node scripts/generate-features.js [--out <dir>] routes/*.json
+//   node scripts/generate-features.js [--out <dir>] [--check] [catalog.json ...]
 //
-// Writes <dir>/features.d.ts (types) and <dir>/src/features.js (runtime
-// table), replacing the hand-written versions; <dir> defaults to the repo
-// root. Run `npm run build` afterwards to refresh index.js.
+// Reads bridge-catalog.json (default) and writes <dir>/features.d.ts and
+// <dir>/src/features.js (<dir> defaults to the repository root). `--check`
+// writes nothing and exits 1 when either file is out of date. Run
+// `npm run build` afterwards to refresh index.js.
 //
-// The routes.json shape below is provisional and kept in this one file so
-// it can follow the native format as that settles:
+// Catalog shape:
 //
 // {
-//   "feature": "vault",
-//   "description": "optional",
-//   "actions": {
-//     "get": {
+//   "features": {
+//     "<id>": {
 //       "description": "optional",
-//       "scheme": "readvault://",          // legacy fallback; omit for JSON-only actions
-//       "params": {
-//         "key": {
-//           "type": "string",               // string | number | integer | boolean | object | array | any
-//           "required": true,
-//           "min": 1, "max": 64,            // numbers: value range; strings/arrays: length
-//           "query": "key",                 // legacy query name (default: param name, false = not sent)
+//       "assets": { "files": ["core.wasm"] },          // optional; paths are validated only
+//       "actions": {
+//         "<name>": {
+//           "kind": "request" | "job",
 //           "description": "optional",
-//           "enum": ["a", "b"],             // optional literal values
-//           "items": { "type": "string" },  // arrays
-//           "properties": { ... },          // objects (each with its own "required")
-//           "additionalProperties": true    // objects: allow extra keys
+//           "args": { "<arg>": { "type": ..., "required": true, ... } },
+//           "result": { "type": ... },                  // request: the value; job: extra fields of `done`
+//           "timeoutMs": 10000,
+//           "job": { "events": ["progress", "log", "done"] },
+//           "legacy": { "scheme", "host"?, "route"?, "variable"?, "callback"?, "answer" }
 //         }
 //       },
-//       "callback": ["{key}"],              // window variables the app writes back ({param} = templated)
-//       "returns": "{key}",                 // resolve with this one variable (default: object of all)
-//       "result": { "type": "string" }      // result type (default: unknown / void when no callback)
+//       "events": { "<name>": { "scope", "data": { ...schema }, "callback"? } }
 //     }
-//   },
-//   "events": {                             // or an array of event names (data: unknown)
-//     "change": { "description": "optional", "data": { "type": "object", "properties": { ... } } }
 //   }
 // }
+//
+// Argument kinds: string, int, number, bool, enum, https_url, array, object,
+// fileRef, json. Result and event schemas also accept null and `nullable`.
 
 const fs = require('fs');
 const path = require('path');
 
-// Names already taken on the despia function object or by the SDK.
+const ROOT = path.join(__dirname, '..');
+
+// Words the SDK keeps on `despia.<word>`, and names that would collide with
+// the function object itself. A feature may not use any of them.
 const RESERVED_FEATURES = new Set([
-  'on', 'legacy', 'DespiaError', 'then', 'call', 'apply', 'bind', 'length', 'name',
-  'prototype', 'arguments', 'caller', 'constructor', 'toString', 'valueOf'
+  'bridge', 'legacy', 'jobs', 'on', 'off', 'ready', 'version', 'call',
+  'then', 'apply', 'bind', 'length', 'name', 'prototype', 'arguments', 'caller', 'constructor'
 ]);
 const RESERVED_ACTIONS = new Set(['on', 'then']);
+const FEATURE_ID = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
+const ACTION_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+const ARG_NAME = /^[a-z][a-zA-Z0-9_]{0,63}$/;
+const EVENT_NAME = /^[a-z][a-zA-Z0-9_]{0,31}$/;
+const SCHEME = /^[a-z][a-z0-9+.-]{0,40}$/;
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-const TYPES = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'any']);
+const ARG_KINDS = new Set(['string', 'int', 'number', 'bool', 'enum', 'https_url', 'array', 'object', 'fileRef', 'json']);
+const SCHEMA_KINDS = new Set([...ARG_KINDS, 'null']);
+const JSON_KINDS = new Set(['array', 'object', 'fileRef', 'json']);
+const ANSWERS = new Set(['envelope', 'variable', 'none']);
 
 function fail(where, message) {
   throw new Error(where + ': ' + message);
 }
+
+// ---- validation -----------------------------------------------------------
+
+function checkSchema(spec, where, kinds) {
+  if (!spec || typeof spec !== 'object') fail(where, 'schema must be an object');
+  if (!kinds.has(spec.type)) fail(where, 'unknown type "' + spec.type + '"');
+  if (spec.type === 'enum' && !(Array.isArray(spec.values) && spec.values.length)) {
+    fail(where, 'enum needs a non-empty "values" list');
+  }
+  if (spec.type === 'array' && spec.items) checkSchema(spec.items, where + '[]', kinds);
+  if (spec.type === 'object') {
+    const props = spec.properties || {};
+    Object.keys(props).forEach((name) => checkSchema(props[name], where + '.' + name, kinds));
+  }
+}
+
+function checkAssets(assets, where) {
+  if (assets === undefined) return;
+  const files = assets && assets.files;
+  if (!Array.isArray(files)) fail(where, '"assets.files" must be a list');
+  files.forEach((file) => {
+    if (typeof file !== 'string' || file === '') fail(where, 'asset path must be a non-empty string');
+    if (file.indexOf('\\') !== -1 || file.charAt(0) === '/') {
+      fail(where, 'asset path "' + file + '" must be relative and use "/"');
+    }
+    file.split('/').forEach((segment) => {
+      if (segment === '.' || segment === '..' || segment === '') {
+        fail(where, 'asset path "' + file + '" has a "' + segment + '" segment; "." and ".." are not allowed');
+      }
+    });
+  });
+}
+
+function checkLegacy(legacy, where) {
+  if (!legacy || typeof legacy !== 'object') fail(where, 'legacy must be an object');
+  if (typeof legacy.scheme !== 'string' || !SCHEME.test(legacy.scheme)) fail(where, 'legacy.scheme is not a valid scheme');
+  if (!ANSWERS.has(legacy.answer)) fail(where, 'legacy.answer must be envelope, variable or none');
+  const names = [].concat(legacy.variable || []);
+  names.forEach((name) => {
+    if (typeof name !== 'string' || !IDENT.test(name.replace(/\{[^}]+\}/g, 'x'))) {
+      fail(where, 'legacy.variable "' + name + '" is not a window variable name');
+    }
+  });
+  if (legacy.answer === 'variable' && !names.length) fail(where, 'legacy.answer "variable" needs legacy.variable');
+}
+
+function checkFeature(id, feature, file) {
+  const where = (file ? file + ': ' : '') + id;
+  if (!FEATURE_ID.test(id) || id.length < 2 || id.length > 32) fail(where, 'invalid feature id');
+  if (RESERVED_FEATURES.has(id)) fail(where, '"' + id + '" is a reserved feature id');
+  if (!feature || typeof feature !== 'object') fail(where, 'feature must be an object');
+  checkAssets(feature.assets, where);
+  const actions = feature.actions || {};
+  Object.keys(actions).forEach((name) => {
+    const here = where + '.' + name;
+    const action = actions[name];
+    if (!ACTION_NAME.test(name)) fail(here, 'invalid action name');
+    if (RESERVED_ACTIONS.has(name)) fail(here, 'action name is reserved');
+    if (!action || (action.kind !== 'request' && action.kind !== 'job')) fail(here, 'kind must be request or job');
+    const args = action.args || {};
+    Object.keys(args).forEach((arg) => {
+      if (!ARG_NAME.test(arg)) fail(here, 'invalid arg name "' + arg + '"');
+      checkSchema(args[arg], here + '.' + arg, ARG_KINDS);
+    });
+    if (action.result) checkSchema(action.result, here + ' result', SCHEMA_KINDS);
+    if (action.timeoutMs !== undefined && !(Number.isInteger(action.timeoutMs) && action.timeoutMs > 0)) {
+      fail(here, 'timeoutMs must be a positive integer');
+    }
+    if (action.legacy) checkLegacy(action.legacy, here);
+    if (action.kind === 'job') {
+      [].concat((action.job && action.job.events) || []).forEach((event) => {
+        if (!EVENT_NAME.test(event)) fail(here, 'invalid job event name "' + event + '"');
+      });
+    }
+  });
+  const events = feature.events || {};
+  Object.keys(events).forEach((name) => {
+    if (!EVENT_NAME.test(name)) fail(where, 'invalid event name "' + name + '"');
+    if (events[name] && events[name].data) checkSchema(events[name].data, where + ':' + name, SCHEMA_KINDS);
+  });
+}
+
+// ---- types ----------------------------------------------------------------
 
 function key(name) {
   return IDENT.test(name) ? name : JSON.stringify(name);
@@ -70,154 +159,207 @@ function doc(lines, pad) {
 }
 
 function rangeDoc(spec) {
-  const length = spec.type === 'string' || spec.type === 'array';
   const out = [];
-  if (spec.min !== undefined) out.push((length ? '@minLength ' : '@minimum ') + spec.min);
-  if (spec.max !== undefined) out.push((length ? '@maxLength ' : '@maximum ') + spec.max);
+  if (spec.type === 'string') {
+    if (spec.min !== undefined) out.push('@minLength ' + spec.min);
+    if (spec.max !== undefined) out.push('@maxLength ' + spec.max);
+  } else if (spec.type === 'int' || spec.type === 'number') {
+    if (spec.min !== undefined) out.push('@minimum ' + spec.min);
+    if (spec.max !== undefined) out.push('@maximum ' + spec.max);
+  } else if (spec.type === 'array') {
+    if (spec.minItems !== undefined) out.push('@minItems ' + spec.minItems);
+    if (spec.maxItems !== undefined) out.push('@maxItems ' + spec.maxItems);
+  }
   return out.join(' ');
 }
 
-function tsType(spec, where, pad) {
-  if (!spec || spec.type === undefined || spec.type === 'any') return 'unknown';
-  if (!TYPES.has(spec.type)) fail(where, 'unknown type "' + spec.type + '"');
-  if (Array.isArray(spec.enum) && spec.enum.length) {
-    return spec.enum.map((v) => JSON.stringify(v)).join(' | ');
-  }
+function baseType(spec, pad) {
   switch (spec.type) {
-    case 'string': return 'string';
-    case 'number':
-    case 'integer': return 'number';
-    case 'boolean': return 'boolean';
+    case 'string':
+    case 'https_url': return 'string';
+    case 'int':
+    case 'number': return 'number';
+    case 'bool': return 'boolean';
+    case 'null': return 'null';
+    case 'fileRef': return 'FileRef';
+    case 'json': return 'unknown';
+    case 'enum': return spec.values.map((v) => JSON.stringify(v)).join(' | ');
     case 'array': {
-      const item = tsType(spec.items, where + '[]', pad);
+      const item = tsType(spec.items, pad);
       return /^[\w.]+$/.test(item) ? item + '[]' : 'Array<' + item + '>';
     }
     case 'object': {
       const props = spec.properties || {};
-      const names = Object.keys(props);
-      if (!names.length) return spec.additionalProperties === false ? '{}' : 'Record<string, unknown>';
-      return objectType(props, where, pad, spec.additionalProperties === true);
+      if (!Object.keys(props).length) return spec.additionalProperties === true || !spec.properties
+        ? 'Record<string, unknown>' : '{}';
+      return objectType(props, pad, spec.additionalProperties === true);
     }
   }
   return 'unknown';
 }
 
-function objectType(props, where, pad, open) {
+function tsType(spec, pad) {
+  if (!spec) return 'unknown';
+  const type = baseType(spec, pad);
+  if (!spec.nullable || spec.type === 'null') return type;
+  return (type.indexOf(' | ') !== -1 ? '(' + type + ')' : type) + ' | null';
+}
+
+function objectType(props, pad, open) {
   const inner = pad + '  ';
   let out = '{\n';
-  for (const name of Object.keys(props)) {
-    const p = props[name] || {};
+  Object.keys(props).forEach((name) => {
+    const p = props[name];
     out += doc([[p.description, rangeDoc(p)].filter(Boolean).join(' ')], inner);
-    out += inner + key(name) + (p.required ? '' : '?') + ': ' + tsType(p, where + '.' + name, inner) + ';\n';
-  }
+    out += inner + key(name) + (p.required ? '' : '?') + ': ' + tsType(p, inner) + ';\n';
+  });
   if (open) out += inner + '[key: string]: unknown;\n';
   return out + pad + '}';
 }
 
-function normaliseEvents(events, where) {
-  if (!events) return {};
-  if (Array.isArray(events)) {
-    const out = {};
-    events.forEach((name) => { out[name] = {}; });
-    return out;
-  }
-  if (typeof events !== 'object') fail(where, '"events" must be an object or an array');
-  return events;
+function argsType(args, pad) {
+  return Object.keys(args || {}).length ? objectType(args, pad, false) : 'void';
 }
 
-function checkRoute(route, file) {
-  const where = file || 'routes';
-  if (!route || typeof route !== 'object') fail(where, 'not an object');
-  const feature = route.feature;
-  if (typeof feature !== 'string' || !IDENT.test(feature)) fail(where, 'invalid "feature" name');
-  if (RESERVED_FEATURES.has(feature)) fail(where, '"' + feature + '" is a reserved name');
-  const actions = route.actions || {};
-  for (const action of Object.keys(actions)) {
-    if (!IDENT.test(action)) fail(where, 'invalid action name "' + action + '"');
-    if (RESERVED_ACTIONS.has(action)) fail(where, 'action "' + action + '" is a reserved name');
-    const params = actions[action].params || {};
-    for (const name of Object.keys(params)) {
-      const t = params[name].type;
-      if (t !== undefined && !TYPES.has(t)) fail(where, feature + '.' + action + '.' + name + ': unknown type "' + t + '"');
+// Job events carry the job id the bridge stamps into their data.
+function withJobId(schema, pad) {
+  const jobId = { type: 'string', required: true };
+  if (!schema) return '{\n' + pad + '  jobId: string;\n' + pad + '  [key: string]: unknown;\n' + pad + '}';
+  if (schema.type === 'object') {
+    const props = Object.assign({}, schema.properties || {});
+    if (!props.jobId) {
+      return tsType(Object.assign({}, schema, { properties: Object.assign({ jobId }, props), nullable: false }), pad);
     }
+    return tsType(schema, pad);
   }
+  return tsType(schema, pad) + ' & { jobId: string }';
 }
 
-function runtimeAction(spec) {
-  const params = {};
-  const query = {};
-  for (const name of Object.keys(spec.params || {})) {
-    const p = spec.params[name];
-    const out = {};
-    if (p.type !== undefined && p.type !== 'any') out.type = p.type;
-    if (p.required) out.required = true;
-    if (p.min !== undefined) out.min = p.min;
-    if (p.max !== undefined) out.max = p.max;
-    params[name] = out;
-    if (p.query !== false) query[p.query || name] = name;
-  }
-  const action = { params };
-  if (spec.scheme) {
-    const legacy = { scheme: spec.scheme };
-    if (Object.keys(query).length) legacy.query = query;
-    const watch = [].concat(spec.callback || []);
-    if (watch.length) legacy.watch = watch;
-    if (spec.returns) legacy.result = spec.returns;
-    action.legacy = legacy;
-  }
-  return action;
+function jobEvents(action) {
+  const listed = action.job && action.job.events;
+  return Array.isArray(listed) && listed.length ? listed : ['progress', 'log', 'done'];
 }
 
-function resultType(spec, where, pad) {
-  if (spec.result) return tsType(spec.result, where, pad);
-  const watch = [].concat(spec.callback || []);
-  if (!watch.length) return 'void';
-  if (spec.returns || watch.some((w) => w.indexOf('{') !== -1)) return 'unknown';
-  return '{ ' + watch.map((w) => key(w) + ': unknown').join('; ') + ' }';
+function doneType(action, events, pad) {
+  const declared = events.done && events.done.data;
+  if (declared) return 'JobDone & ' + withJobId(declared, pad);
+  if (action.result) return 'JobDone & ' + tsType(action.result, pad);
+  return 'JobDone';
 }
 
-function generate(routes) {
+function featureTypes(id, feature) {
+  const actions = feature.actions || {};
+  const events = feature.events || {};
+  const inJob = new Set();
+  Object.keys(actions).forEach((name) => {
+    if (actions[name].kind === 'job') jobEvents(actions[name]).forEach((e) => inJob.add(e));
+  });
+
+  let out = doc([feature.description], '  ');
+  out += '  ' + key(id) + ': {\n    actions: {\n';
+  Object.keys(actions).forEach((name) => {
+    const action = actions[name];
+    out += doc([action.description], '      ');
+    out += '      ' + key(name) + ': {\n';
+    out += "        kind: '" + action.kind + "';\n";
+    out += '        args: ' + argsType(action.args, '        ') + ';\n';
+    if (action.kind === 'job') {
+      out += '        result: ' + doneType(action, events, '        ') + ';\n';
+      out += '        events: {\n';
+      jobEvents(action).filter((e) => e !== 'done').forEach((event) => {
+        const spec = events[event] || {};
+        out += '          ' + key(event) + ': ' + withJobId(spec.data, '          ') + ';\n';
+      });
+      out += '        };\n';
+    } else {
+      out += '        result: ' + (action.result ? tsType(action.result, '        ') : 'void') + ';\n';
+    }
+    out += '      };\n';
+  });
+  out += '    };\n';
+  if (!Object.keys(events).length) return out + '    events: {};\n  };\n';
+  out += '    events: {\n';
+  Object.keys(events).forEach((name) => {
+    const spec = events[name] || {};
+    out += doc([spec.description], '      ');
+    let type;
+    if (name === 'done' && inJob.has('done')) {
+      type = 'JobDone & ' + (spec.data ? withJobId(spec.data, '      ') : '{}');
+    } else if (inJob.has(name)) {
+      type = withJobId(spec.data, '      ');
+    } else {
+      type = spec.data ? tsType(spec.data, '      ') : 'Record<string, unknown>';
+    }
+    out += '      ' + key(name) + ': ' + type + ';\n';
+  });
+  out += '    };\n  };\n';
+  return out;
+}
+
+// ---- runtime table ---------------------------------------------------------
+
+function runtimeLegacy(action) {
+  const legacy = action.legacy;
+  const out = { scheme: legacy.scheme };
+  if (legacy.host) out.host = legacy.host;
+  if (legacy.route) out.route = legacy.route;
+  out.args = Object.keys(action.args || {}).map((arg) => {
+    const spec = action.args[arg];
+    const l = spec.legacy || {};
+    return {
+      arg,
+      name: l.name || arg,
+      encoding: l.encoding || (JSON_KINDS.has(spec.type) ? 'json' : 'plain')
+    };
+  });
+  if (legacy.variable) out.variable = legacy.variable;
+  if (legacy.callback) out.callback = legacy.callback;
+  out.answer = legacy.answer;
+  return out;
+}
+
+function runtimeFeature(feature) {
+  const actions = {};
+  Object.keys(feature.actions || {}).forEach((name) => {
+    const action = feature.actions[name];
+    const out = { kind: action.kind };
+    if (action.timeoutMs !== undefined) out.timeoutMs = action.timeoutMs;
+    if (action.kind === 'job') out.events = jobEvents(action);
+    if (action.legacy) out.legacy = runtimeLegacy(action);
+    actions[name] = out;
+  });
+  return { actions, events: Object.keys(feature.events || {}) };
+}
+
+// ---- generate --------------------------------------------------------------
+
+// sources: [{ file, catalog }]. Returns { dts, js, runtime }.
+function generate(sources) {
   const seen = new Set();
   const runtime = {};
   let types = '';
+  let usesFileRef = false;
 
-  routes.forEach(({ file, route }) => {
-    checkRoute(route, file);
-    const feature = route.feature;
-    if (seen.has(feature)) fail(file, 'feature "' + feature + '" defined twice');
-    seen.add(feature);
-
-    const actions = route.actions || {};
-    const events = normaliseEvents(route.events, file);
-    runtime[feature] = { actions: {}, events: Object.keys(events) };
-
-    types += doc([route.description], '  ');
-    types += '  ' + feature + ': {\n    actions: {\n';
-    for (const action of Object.keys(actions)) {
-      const spec = actions[action] || {};
-      const where = feature + '.' + action;
-      runtime[feature].actions[action] = runtimeAction(spec);
-      const params = spec.params || {};
-      const args = Object.keys(params).length ? objectType(params, where, '        ') : 'void';
-      types += doc([spec.description], '      ');
-      types += '      ' + action + ': {\n';
-      types += '        args: ' + args + ';\n';
-      types += '        result: ' + resultType(spec, where, '        ') + ';\n';
-      types += '      };\n';
+  sources.forEach(({ file, catalog }) => {
+    if (!catalog || typeof catalog !== 'object' || typeof catalog.features !== 'object' || catalog.features === null) {
+      fail(file || 'catalog', 'missing "features" object');
     }
-    const eventNames = Object.keys(events);
-    types += eventNames.length ? '    };\n    events: {\n' : '    };\n    events: {};\n';
-    for (const event of eventNames) {
-      const spec = events[event] || {};
-      types += doc([spec.description], '      ');
-      types += '      ' + key(event) + ': ' + tsType(spec.data, feature + ':' + event, '      ') + ';\n';
-    }
-    types += eventNames.length ? '    };\n  };\n' : '  };\n';
+    Object.keys(catalog.features).forEach((id) => {
+      const feature = catalog.features[id];
+      checkFeature(id, feature, file);
+      if (seen.has(id)) fail(file || 'catalog', 'feature "' + id + '" defined twice');
+      seen.add(id);
+      runtime[id] = runtimeFeature(feature);
+      types += featureTypes(id, feature);
+    });
   });
+  usesFileRef = /\bFileRef\b/.test(types);
 
   const dts = [
     '// features.d.ts - typed feature map for the Despia JSON bridge.',
-    '// Generated by scripts/generate-features.js from routes.json. Do not edit.',
+    '// Generated by scripts/generate-features.js from bridge-catalog.json. Do not edit.',
+    '',
+    "import type { " + (usesFileRef ? 'FileRef, ' : '') + "JobDone } from './index';",
     '',
     'export interface DespiaFeatureMap {',
     types.replace(/\n$/, ''),
@@ -228,8 +370,8 @@ function generate(routes) {
   const js = [
     "'use strict';",
     '',
-    '// Runtime feature map. Generated by scripts/generate-features.js from',
-    '// routes.json. Do not edit; see features.d.ts for the types.',
+    '// Runtime feature table. Generated by scripts/generate-features.js from',
+    '// bridge-catalog.json. Do not edit; see features.d.ts for the types.',
     '',
     'module.exports = ' + JSON.stringify(runtime, null, 2) + ';',
     ''
@@ -238,27 +380,44 @@ function generate(routes) {
   return { dts, js, runtime };
 }
 
-function readRoutes(files) {
-  return files.map((file) => ({ file, route: JSON.parse(fs.readFileSync(file, 'utf8')) }));
+function readCatalogs(files) {
+  return files.map((file) => ({ file, catalog: JSON.parse(fs.readFileSync(file, 'utf8')) }));
 }
 
 if (require.main === module) {
   const argv = process.argv.slice(2);
-  let outDir = path.join(__dirname, '..');
+  let outDir = ROOT;
+  let check = false;
   const files = [];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') outDir = path.resolve(argv[++i]);
+    else if (argv[i] === '--check') check = true;
     else files.push(argv[i]);
   }
-  if (!files.length) {
-    console.error('usage: node scripts/generate-features.js [--out <dir>] <routes.json>...');
-    process.exit(2);
+  if (!files.length) files.push(path.join(ROOT, 'bridge-catalog.json'));
+  let result;
+  try {
+    result = generate(readCatalogs(files));
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
   }
-  const { dts, js } = generate(readRoutes(files));
-  fs.mkdirSync(path.join(outDir, 'src'), { recursive: true });
-  fs.writeFileSync(path.join(outDir, 'features.d.ts'), dts);
-  fs.writeFileSync(path.join(outDir, 'src', 'features.js'), js);
-  console.log('wrote ' + path.join(outDir, 'features.d.ts') + ' and src/features.js');
+  const targets = [
+    [path.join(outDir, 'features.d.ts'), result.dts],
+    [path.join(outDir, 'src', 'features.js'), result.js]
+  ];
+  if (check) {
+    const stale = targets.filter(([file, text]) => !fs.existsSync(file) || fs.readFileSync(file, 'utf8') !== text);
+    if (stale.length) {
+      console.error('out of date: ' + stale.map(([file]) => path.relative(outDir, file)).join(', ') + ' (run `npm run generate`)');
+      process.exit(1);
+    }
+    console.log('features.d.ts and src/features.js are up to date');
+  } else {
+    fs.mkdirSync(path.join(outDir, 'src'), { recursive: true });
+    targets.forEach(([file, text]) => fs.writeFileSync(file, text));
+    console.log('wrote features.d.ts and src/features.js');
+  }
 }
 
-module.exports = { generate, readRoutes };
+module.exports = { generate, readCatalogs, RESERVED_FEATURES };
