@@ -9,7 +9,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadSdk, plain, CURRENT, RELEASE_1_0_28, DESPIA_UA, BROWSER_UA } = require('./helpers');
+const { loadSdk, plain, outcome, CURRENT, RELEASE_1_0_28, DESPIA_UA, BROWSER_UA } = require('./helpers');
 
 // The fake app: answers some legacy commands by writing window variables.
 function nativeApp(transcript, clock) {
@@ -139,13 +139,13 @@ test('legacy despia() is identical to 1.0.28 in a plain browser', async () => {
 test('legacy despia() ignores the new JSON bridge even when it is present', async () => {
   const bridges = {
     userAgent: DESPIA_UA,
-    ios: () => assert.fail('legacy call reached the iOS JSON bridge'),
-    android: () => assert.fail('legacy call reached the Android JSON bridge')
+    bridge: () => assert.fail('legacy call reached the JSON bridge'),
+    hello: () => assert.fail('legacy call asked the JSON bridge for hello')
   };
   const before = await runAgainst(RELEASE_1_0_28, { userAgent: DESPIA_UA });
   const after = await runAgainst(CURRENT, bridges);
   assert.deepStrictEqual(after.transcript, before.transcript);
-  assert.equal(after.env.posted.length, 0);
+  assert.equal(after.env.calls.length, 0);
 });
 
 test('script-tag build still assigns the SDK to window.despia as 1.0.28 did', async () => {
@@ -162,7 +162,7 @@ test('new members are hidden from enumeration, as the 1.0.28 export had none', (
   const env = loadSdk({});
   assert.deepStrictEqual(Object.keys(env.despia), []);
   assert.deepStrictEqual(Object.keys(loadSdk({ file: RELEASE_1_0_28 }).despia), []);
-  for (const name of ['haptics', 'vault', 'device', 'revenuecat', 'gps', 'on', 'legacy', 'DespiaError']) {
+  for (const name of ['haptics', 'vault', 'device', 'revenuecat', 'gps', 'on', 'legacy', 'jobs', 'bridge', 'ready', 'DespiaError', 'LIMITS']) {
     assert.ok(name in env.despia, name);
   }
 });
@@ -196,4 +196,97 @@ test('new namespace names do not shadow documented window variables or browser g
     assert.ok(!documentedVars.includes(name), name + ' collides with a documented variable');
     assert.ok(!browserGlobals.includes(name), name + ' collides with a browser global');
   }
+});
+
+// ---- despia.legacy ------------------------------------------------------------
+
+test('despia.legacy.variable(name, { wait }) resolves when the variable becomes set and changes', async () => {
+  const env = loadSdk({ userAgent: DESPIA_UA });
+  env.win.pushToken = 'old';
+  const waited = outcome(env.despia.legacy.variable('pushToken', { wait: true }));
+  await env.clock.tick(500);
+  assert.equal(waited.settled, false, 'unchanged old value is not an answer');
+  env.win.pushToken = 'new';
+  await env.clock.tick(150);
+  assert.equal(waited.value, 'new');
+});
+
+test('despia.legacy.variable(name, { wait }) ignores "n/a" and empty values, and resolves undefined on timeout', async () => {
+  const env = loadSdk({ userAgent: DESPIA_UA });
+  const waited = outcome(env.despia.legacy.variable('slowVar', { wait: true, timeoutMs: 1000 }));
+  env.win.slowVar = 'n/a';
+  await env.clock.tick(500);
+  assert.equal(waited.settled, false);
+  await env.clock.tick(700);
+  assert.equal(waited.settled, true);
+  assert.equal(waited.value, undefined);
+  assert.equal(env.consoleErrors.length, 1);
+});
+
+test('despia.legacy.call(command, watch) is despia(command, watch)', async () => {
+  const env = loadSdk({
+    userAgent: DESPIA_UA,
+    onCommand: (command, win) => {
+      if (command === 'getappversion://') win.setTimeout(() => { win.versionNumber = '9'; }, 100);
+    }
+  });
+  const got = outcome(env.despia.legacy.call('getappversion://', ['versionNumber']));
+  await env.clock.tick(300);
+  assert.deepStrictEqual(plain(got.value), { versionNumber: '9' });
+  assert.deepStrictEqual(env.commands, ['getappversion://']);
+  assert.equal(await env.despia.legacy.call('lighthaptic://'), undefined);
+});
+
+test('despia.legacy.variable and call refuse names that are not window variable names', () => {
+  const env = loadSdk({ userAgent: DESPIA_UA });
+  for (const bad of ['', 'a b', '1abc', 'a-b', 'a.b', '__proto__', 'constructor', 'despiaBridge', '__despiaBridgeDeliver',
+    'despia', '_despia', 'x'.repeat(65), undefined, null, 5, {}]) {
+    assert.throws(() => env.despia.legacy.variable(bad), { name: 'TypeError' }, String(bad));
+    assert.throws(() => env.despia.legacy.variable(bad, { wait: true }), { name: 'TypeError' }, String(bad));
+  }
+  env.win.$ok_1 = 3;
+  assert.equal(env.despia.legacy.variable('$ok_1'), 3);
+});
+
+// ---- namespace order ----------------------------------------------------------
+
+test('despia.<x> resolves SDK words first, then catalog features, then window variables', () => {
+  const env = loadSdk({ fixture: true, userAgent: DESPIA_UA });
+  const d = env.despia;
+  // A window variable with the same name never wins over an SDK word or a feature.
+  for (const word of ['legacy', 'on', 'jobs', 'bridge', 'ready']) env.win[word] = 'window-value';
+  env.win.vault = 'window-value';
+  env.win.notes = 'window-value';
+  env.win.appsFlyerUID = 'af-1';
+  env.win.versionNumber = '2.0';
+
+  assert.equal(typeof d.on, 'function');
+  assert.equal(typeof d.ready, 'function');
+  assert.equal(typeof d.legacy.variable, 'function');
+  assert.equal(typeof d.jobs.list, 'function');
+  assert.equal(typeof d.bridge.hello, 'function');
+  assert.equal(typeof d.vault.get, 'function');
+  assert.equal(typeof d.notes.get, 'function');
+  assert.equal(typeof d.ffmpeg.run, 'function');
+  // Everything else is the old pass-through.
+  assert.equal(d.appsFlyerUID, 'af-1');
+  assert.equal(d.versionNumber, '2.0');
+  assert.equal(d.notDefined, undefined);
+});
+
+test('the namespaces are frozen and hidden from enumeration', () => {
+  const env = loadSdk({ fixture: true, userAgent: DESPIA_UA });
+  assert.deepStrictEqual(Object.keys(env.despia), []);
+  assert.equal(Object.isFrozen(env.despia.vault), true);
+  assert.equal(Object.isFrozen(env.despia.jobs), true);
+  assert.equal(Object.isFrozen(env.despia.bridge), true);
+  assert.throws(() => { 'use strict'; env.despia.vault = 1; }, TypeError);
+});
+
+test('despia.LIMITS carries the hard limits', () => {
+  const { LIMITS } = loadSdk({}).despia;
+  assert.deepStrictEqual(plain(LIMITS), {
+    maxMessageBytes: 4194304, maxDepth: 32, maxNodes: 100000, maxKeyLength: 128,
+    maxInFlight: 64, maxPerSecond: 200, newStringMaxBytes: 262144
+  });
 });

@@ -1,137 +1,146 @@
 'use strict';
 
-// Events: per-feature listeners, off, and broadcast.
+// Broadcast and per-feature listeners, and how they subscribe with native.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadSdk, plain, DESPIA_UA } = require('./helpers');
+const { loadSdk, plain, ok, DESPIA_UA } = require('./helpers');
 
-const point = { active: true, latitude: 52.52, longitude: 13.405 };
+function app(extra = {}) {
+  return loadSdk(Object.assign({
+    fixture: true,
+    userAgent: DESPIA_UA,
+    bridge: (call) => {
+      if (call.feature === 'bridge') return call.action === 'subscribe' ? ok({ subscribed: true }) : ok({});
+    }
+  }, extra));
+}
 
-test('native emit reaches feature listeners; off stops delivery', () => {
-  const env = loadSdk({ userAgent: DESPIA_UA });
-  const seen = [];
-  const off = env.despia.gps.on('change', (data) => seen.push(plain(data)));
+const subs = (env) => env.calls.filter((c) => c.feature === 'bridge' && /subscribe/.test(c.action));
 
-  assert.equal(env.win.__despia.emit({ feature: 'gps', event: 'change', data: point }), true);
-  assert.deepEqual(seen, [point]);
-
+test('despia.on: hears every packet, with the whole packet', async () => {
+  const env = app();
+  const heard = [];
+  const off = env.despia.on((p) => heard.push(plain(p)));
+  await env.clock.tick(0);
+  env.emit({ feature: 'ffmpeg', event: 'progress', jobId: 'j-1', seq: 1, data: { jobId: 'j-1', percent: 5 } });
+  env.emit({ feature: 'bridge', event: 'job', data: { jobId: 'j-1', state: 'running' } });
+  env.emit({ feature: 'notes', event: 'changed', data: {} });
+  assert.deepStrictEqual(heard.map((p) => p.feature + '.' + p.event), ['ffmpeg.progress', 'bridge.job', 'notes.changed']);
+  assert.equal(heard[0].seq, 1);
+  assert.equal(heard[0].v, 1);
+  assert.equal(heard[0].t, 'event');
   off();
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.equal(seen.length, 1);
-  off(); // idempotent
+  env.emit({ feature: 'notes', event: 'changed', data: {} });
+  assert.equal(heard.length, 3);
 });
 
-test('listeners only hear their own feature and event', () => {
-  const env = loadSdk({});
-  const seen = [];
-  env.despia.gps.on('change', () => seen.push('gps:change'));
-  env.despia.revenuecat.on('purchase', () => seen.push('revenuecat:purchase'));
-
-  env.win.__despia.emit({ feature: 'revenuecat', event: 'purchase', data: { productId: 'monthly' } });
-  env.win.__despia.emit({ feature: 'gps', event: 'other', data: null });
-  env.win.__despia.emit({ feature: 'vault', event: 'change', data: null });
-  assert.deepEqual(seen, ['revenuecat:purchase']);
+test('despia.on: subscribes to everything once, unsubscribes when the last listener leaves', async () => {
+  const env = app();
+  const a = env.despia.on(() => {});
+  const b = env.despia.on(() => {});
+  await env.clock.tick(0);
+  assert.deepStrictEqual(subs(env).map((c) => [c.action, c.args]), [['subscribe', { feature: '*' }]]);
+  a();
+  await env.clock.tick(0);
+  assert.equal(subs(env).length, 1);
+  b();
+  b();
+  await env.clock.tick(0);
+  assert.deepStrictEqual(subs(env).map((c) => [c.action, c.args]),
+    [['subscribe', { feature: '*' }], ['unsubscribe', { feature: '*' }]]);
 });
 
-test('several listeners on one event each get the data, and off removes only one', () => {
-  const env = loadSdk({});
-  const seen = [];
-  const fn = (d) => seen.push(d.latitude);
-  const offA = env.despia.gps.on('change', fn);
-  env.despia.gps.on('change', fn); // same function twice: two subscriptions
-
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, [52.52, 52.52]);
-
-  offA();
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, [52.52, 52.52, 52.52]);
+test('feature.on: receives that feature and event only, with the data', async () => {
+  const env = app();
+  const got = [];
+  env.despia.ffmpeg.on('progress', (data) => got.push(plain(data)));
+  await env.clock.tick(0);
+  env.emit({ feature: 'ffmpeg', event: 'progress', jobId: 'j-1', seq: 1, data: { jobId: 'j-1', percent: 1 } });
+  env.emit({ feature: 'ffmpeg', event: 'log', jobId: 'j-1', seq: 2, data: { jobId: 'j-1', level: 'info', line: 'x' } });
+  env.emit({ feature: 'media', event: 'progress', data: { percent: 9 } });
+  assert.deepStrictEqual(got, [{ jobId: 'j-1', percent: 1 }]);
 });
 
-test('despia.on hears every event (broadcast), including features without typed events', () => {
-  const env = loadSdk({});
-  const all = [];
-  const off = env.despia.on((e) => all.push(plain(e)));
+test('feature.on: filters by jobId', async () => {
+  const env = app();
+  const got = [];
+  env.despia.ffmpeg.on('progress', (d) => got.push(d.percent), { jobId: 'j-2' });
+  await env.clock.tick(0);
+  env.emit({ feature: 'ffmpeg', event: 'progress', jobId: 'j-1', seq: 1, data: { jobId: 'j-1', percent: 1 } });
+  env.emit({ feature: 'ffmpeg', event: 'progress', jobId: 'j-2', seq: 1, data: { jobId: 'j-2', percent: 2 } });
+  assert.deepStrictEqual(got, [2]);
+});
 
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  env.win.__despia.emit({ feature: 'camera', event: 'captured', data: { path: '/tmp/a.jpg' } });
-  assert.deepEqual(all, [
-    { feature: 'gps', event: 'change', data: point },
-    { feature: 'camera', event: 'captured', data: { path: '/tmp/a.jpg' } }
+test('feature.on: subscribes per feature and event, counted across listeners', async () => {
+  const env = app();
+  const a = env.despia.ffmpeg.on('progress', () => {});
+  const b = env.despia.ffmpeg.on('progress', () => {});
+  const c = env.despia.ffmpeg.on('log', () => {});
+  await env.clock.tick(0);
+  assert.deepStrictEqual(subs(env).map((x) => [x.action, x.args]), [
+    ['subscribe', { feature: 'ffmpeg', events: ['progress'] }],
+    ['subscribe', { feature: 'ffmpeg', events: ['log'] }]
   ]);
-
-  off();
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.equal(all.length, 2);
+  a(); b(); c();
+  await env.clock.tick(0);
+  assert.deepStrictEqual(subs(env).slice(2).map((x) => [x.action, x.args]), [
+    ['unsubscribe', { feature: 'ffmpeg', events: ['progress'] }],
+    ['unsubscribe', { feature: 'ffmpeg', events: ['log'] }]
+  ]);
 });
 
-test('feature listeners run before broadcast listeners', () => {
-  const env = loadSdk({});
-  const order = [];
-  env.despia.on(() => order.push('broadcast'));
-  env.despia.gps.on('change', () => order.push('feature'));
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(order, ['feature', 'broadcast']);
-});
-
-test('a throwing listener does not stop the others', () => {
-  const env = loadSdk({});
+test('listeners: a throwing listener does not stop the others; off is idempotent', async () => {
+  const env = app();
   const seen = [];
-  env.despia.gps.on('change', () => { throw new Error('bad listener'); });
-  env.despia.gps.on('change', () => seen.push('second'));
-  env.despia.on(() => seen.push('broadcast'));
-
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, ['second', 'broadcast']);
-  assert.match(env.consoleErrors[0], /Despia event listener failed/);
+  env.despia.on(() => { throw new Error('boom'); });
+  env.despia.on((p) => seen.push(p.event));
+  await env.clock.tick(0);
+  env.emit({ feature: 'notes', event: 'changed', data: {} });
+  assert.deepStrictEqual(seen, ['changed']);
+  assert.equal(env.consoleErrors.length, 1);
 });
 
-test('a listener may unsubscribe itself while being called', () => {
-  const env = loadSdk({});
+test('listeners: argument checks', () => {
+  const env = app();
+  assert.throws(() => env.despia.on(), { name: 'TypeError' });
+  assert.throws(() => env.despia.ffmpeg.on('progress'), { name: 'TypeError' });
+  assert.throws(() => env.despia.ffmpeg.on('', () => {}), { name: 'TypeError' });
+});
+
+test('listeners: malformed packets are ignored', async () => {
+  const env = app();
   const seen = [];
-  const off = env.despia.gps.on('change', () => { seen.push('once'); off(); });
-  env.despia.gps.on('change', () => seen.push('always'));
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  env.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, ['once', 'always', 'always']);
+  env.despia.on((p) => seen.push(p.event));
+  await env.clock.tick(0);
+  const ignored = [null, 'text', 5, {}, { feature: 'x' }, { event: 'y' }];
+  ignored.forEach((raw) => env.listeners.forEach((fn) => fn(raw)));
+  env.emit({ feature: 'notes', event: 'ok-without-data' }); // data defaults to {}
+  assert.deepStrictEqual(seen, ['ok-without-data']);
 });
 
-test('emit accepts a JSON string and ignores malformed payloads', () => {
-  const env = loadSdk({});
-  const all = [];
-  env.despia.on((e) => all.push(plain(e)));
-
-  assert.equal(env.win.__despia.emit(JSON.stringify({ feature: 'gps', event: 'change', data: point })), true);
-  assert.equal(env.win.__despia.emit('{not json'), false);
-  assert.equal(env.win.__despia.emit({ feature: 'gps' }), false);
-  assert.equal(env.win.__despia.emit(null), false);
-  assert.deepEqual(all, [{ feature: 'gps', event: 'change', data: point }]);
+test('despia.bridge.on: bridge job state events', async () => {
+  const env = app();
+  const states = [];
+  env.despia.bridge.on('job', (info) => states.push(info.state));
+  await env.clock.tick(0);
+  assert.deepStrictEqual(subs(env)[0].args, { feature: 'bridge', events: ['job'] });
+  env.emit({ feature: 'bridge', event: 'job', data: { jobId: 'j-1', state: 'running' } });
+  env.emit({ feature: 'bridge', event: 'job', data: { jobId: 'j-1', state: 'done' } });
+  assert.deepStrictEqual(states, ['running', 'done']);
 });
 
-test('Android may deliver events over the despia_bridge channel', () => {
-  const env = loadSdk({ android: () => {} });
-  const seen = [];
-  env.despia.gps.on('change', (d) => seen.push(plain(d)));
-  env.androidSend({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, [point]);
-});
+test('plain browser and legacy-only apps: listeners register, nothing is sent, nothing fires', async () => {
+  const browser = loadSdk({ fixture: true });
+  const off1 = browser.despia.ffmpeg.on('progress', () => assert.fail('fired'));
+  const off2 = browser.despia.on(() => assert.fail('fired'));
+  await browser.clock.tick(0);
+  off1(); off2();
 
-test('two SDK copies on one page share the emit hook', () => {
-  const first = loadSdk({});
-  const second = loadSdk({ context: first });
-  assert.notEqual(first.despia, second.despia);
-
-  const seen = [];
-  first.despia.gps.on('change', () => seen.push('first'));
-  second.despia.gps.on('change', () => seen.push('second'));
-  first.win.__despia.emit({ feature: 'gps', event: 'change', data: point });
-  assert.deepEqual(seen, ['first', 'second']);
-});
-
-test('on() rejects bad listeners and event names synchronously', () => {
-  const env = loadSdk({});
-  assert.throws(() => env.despia.gps.on('change'), { name: 'TypeError' });
-  assert.throws(() => env.despia.gps.on('', () => {}), { name: 'TypeError' });
-  assert.throws(() => env.despia.on('not a function'), { name: 'TypeError' });
+  const refused = app({ hello: null });
+  const off3 = refused.despia.ffmpeg.on('progress', () => assert.fail('fired'));
+  await refused.clock.tick(0);
+  off3();
+  await refused.clock.tick(0);
+  assert.deepStrictEqual(subs(refused), []);
 });

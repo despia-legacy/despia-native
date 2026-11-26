@@ -8,11 +8,39 @@ const path = require('path');
 const vm = require('vm');
 
 const ROOT = path.join(__dirname, '..');
+const { build } = require('../scripts/build');
+const { generate, readCatalogs } = require('../scripts/generate-features');
 const CURRENT = path.join(ROOT, 'index.js');
 const RELEASE_1_0_28 = path.join(__dirname, 'fixtures', 'index-1.0.28.js');
 
 const BROWSER_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148';
 const DESPIA_UA = BROWSER_UA + ' despia';
+const FIXTURE_CATALOG = path.join(__dirname, 'fixtures', 'bridge-catalog.json');
+
+// Bundle of the SDK with the fixture catalog compiled in.
+let fixtureBundle = null;
+function fixtureSource() {
+  if (!fixtureBundle) {
+    fixtureBundle = build({ features: generate(readCatalogs([FIXTURE_CATALOG])).js });
+  }
+  return fixtureBundle;
+}
+
+const ok = (value) => ({ v: 1, t: 'reply', id: 'x', ok: true, value });
+const fail = (code, message, extra) => ({
+  v: 1, t: 'reply', id: 'x', ok: false, error: Object.assign({ code, message: message || code }, extra)
+});
+
+const HELLO = {
+  v: 1,
+  platform: 'ios',
+  features: {
+    media: { version: '1.0.0', actions: ['pick'], events: [] },
+    ffmpeg: { version: '1.0.0', actions: ['run'], events: ['progress', 'log', 'done'] },
+    notes: { version: '1.0.0', actions: ['get', 'search'], events: [] }
+  },
+  limits: { maxMessageBytes: 4194304, maxInFlight: 64 }
+};
 
 function createClock() {
   let now = 1700000000000;
@@ -73,14 +101,18 @@ function createClock() {
 //   userAgent   navigator.userAgent (default: plain browser)
 //   mode        'cjs' (module.exports) or 'global' (script tag)
 //   onCommand   (command, win) => void, called for each legacy window.despia assignment
-//   ios         (msg) => reply | Promise<reply>  installs webkit.messageHandlers.despia
-//   android     (msg, env) => void               installs window.despia_bridge
-//   androidOnMessage  use bridge.onmessage instead of addEventListener
+//   source      SDK source text to run instead of a file
+//   fixture     true: bundle the SDK with test/fixtures/bridge-catalog.json
+//   bridge      (call, env) => reply | Promise<reply>  installs window.despiaBridge
+//               call = { feature, action, args, opts }; never sees bridge.hello
+//   hello       the hello value (default HELLO); null = refuse it with forbidden_origin;
+//               a function (call, env) => reply answers it itself
+//   env.emit(packet)   native -> page event; env.calls records every native call
 //   noWindow    load without window (server-side rendering)
 //   context     reuse an existing env's context (second SDK copy on one page)
 function loadSdk(opts = {}) {
   const file = opts.file || CURRENT;
-  const source = fs.readFileSync(file, 'utf8');
+  const source = opts.source || (opts.fixture ? fixtureSource() : fs.readFileSync(file, 'utf8'));
   const log = [];
 
   let env;
@@ -134,44 +166,38 @@ function loadSdk(opts = {}) {
       });
     }
 
-    if (opts.ios) {
-      win.webkit = {
-        messageHandlers: {
-          despia: {
-            postMessage(msg) {
-              posted.push(JSON.parse(JSON.stringify(msg)));
-              return opts.ios(msg, env);
-            }
-          }
-        }
-      };
-    }
-
-    if (opts.android) {
+    if (opts.bridge) {
       const listeners = [];
-      const bridge = {
-        postMessage(json) {
-          if (typeof json !== 'string') throw new TypeError('android bridge only accepts strings');
-          const msg = JSON.parse(json);
-          posted.push(msg);
-          opts.android(msg, env);
+      const calls = [];
+      env.calls = calls;
+      env.listeners = listeners;
+      const native = Object.freeze({
+        v: 1,
+        platform: 'ios',
+        call(feature, action, args, callOpts) {
+          const call = {
+            feature, action, args: plain(args),
+            opts: callOpts === undefined ? undefined : plain(callOpts),
+            argc: arguments.length
+          };
+          calls.push(call);
+          let reply;
+          if (feature === 'bridge' && action === 'hello') {
+            if (opts.hello === null) reply = fail('forbidden_origin', 'not the app origin');
+            else if (typeof opts.hello === 'function') reply = opts.hello(call, env);
+            else reply = ok(opts.hello || HELLO);
+          } else {
+            reply = opts.bridge(call, env);
+          }
+          return Promise.resolve(reply);
+        },
+        listen(fn) {
+          listeners.push(fn);
+          return () => { const i = listeners.indexOf(fn); if (i !== -1) listeners.splice(i, 1); };
         }
-      };
-      if (opts.androidOnMessage) {
-        bridge.onmessage = null;
-      } else {
-        bridge.addEventListener = (type, fn) => { if (type === 'message') listeners.push(fn); };
-      }
-      win.despia_bridge = bridge;
-      // Native -> page message over the listener object.
-      env.androidSend = (obj) => {
-        const event = { data: typeof obj === 'string' ? obj : JSON.stringify(obj) };
-        if (opts.androidOnMessage) {
-          if (typeof bridge.onmessage === 'function') bridge.onmessage(event);
-        } else {
-          listeners.slice().forEach((fn) => fn(event));
-        }
-      };
+      });
+      Object.defineProperty(win, 'despiaBridge', { value: native, enumerable: false });
+      env.emit = (packet) => listeners.slice().forEach((fn) => fn(Object.assign({ v: 1, t: 'event' }, packet)));
     }
   }
 
@@ -204,6 +230,6 @@ function outcome(promise) {
 }
 
 module.exports = {
-  ROOT, CURRENT, RELEASE_1_0_28, BROWSER_UA, DESPIA_UA,
-  loadSdk, createClock, plain, outcome
+  ROOT, CURRENT, RELEASE_1_0_28, BROWSER_UA, DESPIA_UA, FIXTURE_CATALOG, HELLO,
+  ok, fail, loadSdk, createClock, plain, outcome
 };

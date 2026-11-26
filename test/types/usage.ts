@@ -4,11 +4,15 @@
 import despia, {
   DespiaArgs,
   DespiaError,
-  DespiaEvent,
   DespiaOff,
   DespiaResult,
-  GpsPoint,
-  RevenueCatPurchase,
+  ErrorCode,
+  EventPacket,
+  Hello,
+  Job,
+  JobInfo,
+  Callbacks,
+  FeatureStatus,
 } from '../..';
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
@@ -18,9 +22,9 @@ async function typedCalls(): Promise<void> {
   // Results are typed per action.
   const nothing: void = await despia.haptics.light();
   const token: string = await despia.vault.get({ key: 'sessionToken' });
-  const version = await despia.device.appVersion();
+  const version = await despia.device.app_version();
   const versionNumber: string = version.versionNumber;
-  const history: RevenueCatPurchase[] = await despia.revenuecat.history();
+  const history = await despia.revenuecat.history();
   const active: boolean = history[0].isActive;
   void nothing; void token; void versionNumber; void active;
 
@@ -51,9 +55,8 @@ async function typedCalls(): Promise<void> {
 
 function events(): void {
   const off: DespiaOff = despia.gps.on('change', (point) => {
-    const p: GpsPoint = point;
     const lat: number = point.latitude;
-    void p; void lat;
+    void lat;
   });
   off();
 
@@ -64,13 +67,16 @@ function events(): void {
   // @ts-expect-error: haptics has no events
   despia.haptics.on('change', () => {});
 
-  const offAll = despia.on((e: DespiaEvent) => {
-    if (e.feature === 'gps' && e.event === 'change') {
-      const lng: number = e.data.longitude;
-      void lng;
-    }
-    // @ts-expect-error: not a typed feature
-    if (e.feature === 'nope') return;
+  // Options of a listener.
+  despia.gps.on('change', () => {}, { since: 'all' });
+  despia.gps.on('change', () => {}, { since: 3, jobId: 'j-1' });
+  // @ts-expect-error: since is a number or 'all'
+  despia.gps.on('change', () => {}, { since: 'some' });
+
+  const offAll = despia.on((p: EventPacket) => {
+    const where: string = p.feature + '.' + p.event;
+    const replayed: true | undefined = p.replay;
+    void where; void replayed;
   });
   offAll();
 }
@@ -82,8 +88,9 @@ async function errors(): Promise<void> {
     if (err instanceof despia.DespiaError) {
       const e: DespiaError = err;
       const code: string = e.code;
-      if (e.code === 'not_in_app') return;
-      void code;
+      const known: ErrorCode = 'undeclared_dependency';
+      if (e.code === 'not_in_app' || e.code === 'aborted') return;
+      void code; void known;
     }
   }
 }
@@ -100,4 +107,33 @@ async function legacyStillTyped(): Promise<void> {
   void queued; void vars; void uuid; void anyWindowVar; void maybe;
 }
 
-void typedCalls; void events; void errors; void legacyStillTyped;
+async function bridgeWords(): Promise<void> {
+  const state = await despia.ready();
+  if (state.hello) {
+    const hello: Hello = state.hello;
+    const contract: '1.1' | undefined = hello.contract;
+    const origin: 'web' | 'local_app' | undefined = hello.origin;
+    const deps: Record<string, string> | undefined = hello.features.x.dependencies;
+    void contract; void origin; void deps;
+  }
+  const bridge: boolean = state.bridge;
+  const list: JobInfo[] = await despia.jobs.list({ feature: 'x', states: ['running'] });
+  const one: JobInfo = await despia.jobs.get('j-1');
+  const cancelled = await despia.jobs.cancel('j-1');
+  const status: FeatureStatus = await despia.bridge.status({ feature: 'x' });
+  const dep: 'installed' | 'not_installed' | 'disabled' | undefined = status.dependencies?.y;
+  const hello: Hello = await despia.bridge.hello();
+  const offJob = despia.bridge.on('job', (info) => { const s: string = info.state; void s; });
+  const max: 4194304 = despia.LIMITS.maxMessageBytes;
+  const noop: Job | undefined = undefined;
+  const cb: Callbacks = { progress: () => {}, done: () => {}, error: (e) => void e.jobId };
+  const native: Window['despiaBridge'] = window.despiaBridge;
+  void bridge; void list; void one; void cancelled; void dep; void hello; void offJob; void max; void noop; void cb; void native;
+
+  // @ts-expect-error: the injected object's internal field is not part of any SDK type
+  void hello.cap;
+  // @ts-expect-error: no such built-in action
+  await despia.bridge.nope();
+}
+
+void typedCalls; void events; void errors; void legacyStillTyped; void bridgeWords;
