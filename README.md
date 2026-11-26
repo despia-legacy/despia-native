@@ -10,7 +10,7 @@
 >
 > Current documentation: [docs.despia.com](https://docs.despia.com)
 
-Add 50+ native iOS and Android capabilities to any web app (React, Vue, Angular, Svelte, Next.js, vanilla JS) through a single `despia()` function. Plus native offline support, a local SQLite database, and an on-device streaming CDN, solving 15 years of hybrid-app problems with modern runtime architecture.
+Add 50+ native iOS and Android capabilities to any web app (React, Vue, Angular, Svelte, Next.js, vanilla JS) through one typed `despia` object: real JSON arguments in, promises and events out. Plus native offline support, a local SQLite database, and an on-device streaming CDN, solving 15 years of hybrid-app problems with modern runtime architecture.
 
 [![npm](https://img.shields.io/npm/v/despia-native)](https://www.npmjs.com/package/despia-native)
 
@@ -52,25 +52,25 @@ Or via CDN:
 import despia from 'despia-native';
 
 // Launch a RevenueCat paywall
-despia(`revenuecat://launchPaywall?external_id=${userId}&offering=default`);
-
-// Link the device to your user for OneSignal push
-despia(`setonesignalplayerid://?user_id=${userId}`);
+await despia.revenuecat.paywall({ externalId: userId, offering: 'default' });
 
 // Store a session token behind Face ID / Touch ID (survives reinstall)
-await despia('setvault://?key=sessionToken&value=abc123&locked=true');
+await despia.vault.set({ key: 'sessionToken', value: 'abc123', locked: true });
 
 // Read it back later (prompts biometric)
-const { sessionToken } = await despia('readvault://?key=sessionToken', ['sessionToken']);
+const sessionToken = await despia.vault.get({ key: 'sessionToken' });
+
+// Listen for native events; the return value unsubscribes
+const off = despia.gps.on('change', (point) => console.log(point.latitude, point.longitude));
 ```
 
-No initialization. Open your app in the Despia runtime and it works.
+No initialization. Open your app in the Despia runtime and it works. Every call is typed: TypeScript checks action names, arguments and results at compile time.
 
 ---
 
 ## Why Despia
 
-Despia is a hybrid app runtime built on the web platform. The web handles what it's good at (logic, UI, routing, state, storage); everything else (biometrics, push, in-app purchases, background GPS, system pickers) is handed to a native engine via a single `despia()` call.
+Despia is a hybrid app runtime built on the web platform. The web handles what it's good at (logic, UI, routing, state, storage); everything else (biometrics, push, in-app purchases, background GPS, system pickers) is handed to a native engine through the `despia` object.
 
 Works with any web codebase. Bring an existing app or start fresh with any framework, any build tool, any host. No framework lock-in, no proprietary hosting, nothing to migrate.
 
@@ -101,7 +101,21 @@ Push, monetization, ads, and attribution are built in: OneSignal, RevenueCat, Ad
 
 ## Environment Detection
 
-The SDK only activates inside the Despia runtime. Gate native calls:
+The SDK only activates inside the Despia runtime. In a plain browser every typed call rejects with a `DespiaError` whose `code` is `'not_in_app'`, so you can fall back in one place:
+
+```js
+try {
+  await despia.revenuecat.purchase({ externalId: userId, product: 'monthly_premium' });
+} catch (err) {
+  if (err instanceof despia.DespiaError && err.code === 'not_in_app') {
+    window.location.href = webCheckoutUrl;
+  } else {
+    throw err;
+  }
+}
+```
+
+To check up front, read the user agent:
 
 ```js
 const isDespia = navigator.userAgent.toLowerCase().includes('despia');
@@ -113,7 +127,7 @@ const isDespiaIOS = isDespia && (
 
 const isDespiaAndroid = isDespia && navigator.userAgent.toLowerCase().includes('android');
 
-if (isDespia) despia('lighthaptic://');
+if (isDespia) despia.haptics.light();
 ```
 
 ---
@@ -123,8 +137,11 @@ if (isDespia) despia('lighthaptic://');
 Full API context: [`llms.txt`](https://setup.despia.com/llms.txt).
 
 - Import as default: `import despia from 'despia-native'`
+- Use the typed form `despia.<feature>.<action>({ ...args })`; it returns a Promise and rejects with `despia.DespiaError`
+- Pass plain JSON objects as arguments; do not build query strings or URL-encode values
+- Subscribe with `despia.<feature>.on(event, fn)` and call the returned function to unsubscribe
 - Never write `window.despia` directly; the SDK uses it internally
-- There is no `.init()`, `.ready()`, or `.setup()`; the SDK exports a single function with no initialization
+- There is no `.init()`, `.ready()`, or `.setup()`; the SDK needs no initialization
 - Do not mock or reimplement the SDK; mock implementations will not trigger the native runtime on real devices
 - Gate native calls with the environment check above
 - For Local Server apps, install via a package manager so the SDK ships with the build
@@ -135,16 +152,74 @@ Full API context: [`llms.txt`](https://setup.despia.com/llms.txt).
 
 ## API Reference
 
-### `despia(command, watch?)`
+### `despia.<feature>.<action>(args?)`
 
-| Parameter | Type       | Description                                    |
-| --------- | ---------- | ---------------------------------------------- |
-| `command` | `string`   | A Despia protocol URL, e.g. `'lighthaptic://'` |
-| `watch`   | `string[]` | Variable names to wait for                     |
+Calls a native action with a plain JSON object and returns a `Promise` of its result.
 
-Returns a `Promise` that resolves when all watched variables are set, with a 30-second timeout. Long-running work (downloads, purchases, biometric prompts) reports back via global callbacks like `window.onRevenueCatPurchase` or `window.contentServerChange` instead. `despia.variableName` is equivalent to `window.variableName`.
+```ts
+const token: string = await despia.vault.get({ key: 'sessionToken' });
+const { versionNumber, bundleNumber } = await despia.device.appVersion();
+await despia.haptics.success();
+```
 
-Protocol format: `feature://action?param1=value1&param2=value2`
+Arguments are checked twice: at compile time against the typed feature map, and at runtime (required fields, types, `min`/`max`) before anything is sent. A failed check rejects with `code: 'invalid_args'`.
+
+### `despia.<feature>.on(event, listener)`
+
+Subscribes to one native event. Returns an `off()` function.
+
+```ts
+const off = despia.gps.on('change', (point) => updateMap(point.latitude, point.longitude));
+off();
+```
+
+### `despia.on(listener)`
+
+Hears every event from every feature (broadcast). Returns an `off()` function.
+
+```ts
+const off = despia.on(({ feature, event, data }) => console.log(feature, event, data));
+```
+
+### `despia.legacy.variable(name)`
+
+Reads a value the app injected as a window variable, e.g. `despia.legacy.variable('appsFlyerUID')`.
+
+### Errors
+
+Rejections are `despia.DespiaError` instances with a `code` and a `message`. Codes from the native side pass through unchanged; the SDK adds:
+
+| Code           | Meaning                                                              |
+| -------------- | -------------------------------------------------------------------- |
+| `not_in_app`   | Running in a plain browser, outside the Despia app                   |
+| `invalid_args` | Arguments failed validation or are not JSON-serialisable             |
+| `unsupported`  | The app build is too old for this action                             |
+| `timeout`      | An older app build did not answer in time                            |
+| `bridge_error` | The native bridge failed or sent a malformed reply                   |
+| `native_error` | The native side failed without a structured error                    |
+
+### Typed features
+
+| Feature              | Actions                                           | Events     |
+| -------------------- | ------------------------------------------------- | ---------- |
+| `despia.haptics`     | `light`, `heavy`, `success`, `warning`, `error`   |            |
+| `despia.vault`       | `set`, `get`                                      |            |
+| `despia.device`      | `appVersion`, `uuid`, `storeLocation`             |            |
+| `despia.revenuecat`  | `purchase`, `paywall`, `history`                  | `purchase` |
+| `despia.gps`         | `start`, `stop`                                   | `change`   |
+
+More features join the typed map as the native app publishes them. Features not listed yet are called with a protocol URL, shown in their sections below; that form keeps working.
+
+### TypeScript
+
+Types ship with the package. Helper types are exported for your own wrappers:
+
+```ts
+import despia, { type DespiaArgs, type DespiaResult } from 'despia-native';
+
+type VaultGetArgs = DespiaArgs<'vault', 'get'>;   // { key: string }
+type Version = DespiaResult<'device', 'appVersion'>;
+```
 
 ---
 
@@ -168,24 +243,28 @@ import { VersionGuard } from 'despia-version-guard';
 
 ## Features
 
+Haptics, Identity Vault, device info, RevenueCat and GPS use the typed API. The other features below are not in the typed map yet and are called with a protocol URL, `despia('feature://action?…')`, until they are.
+
 ### RevenueCat In-App Purchases
 
 ```js
 // Paywall
-despia(`revenuecat://launchPaywall?external_id=${userId}&offering=default`);
+await despia.revenuecat.paywall({ externalId: userId, offering: 'default' });
 
 // Direct purchase
-despia(`revenuecat://purchase?external_id=${userId}&product=monthly_premium_ios`);
+await despia.revenuecat.purchase({ externalId: userId, product: 'monthly_premium_ios' });
 ```
 
-`window.onRevenueCatPurchase()` fires when the store confirms a transaction. Verify entitlement before unlocking (via your backend webhook, or by reading the store directly):
+The `purchase` event fires when the store confirms a transaction. Verify entitlement before unlocking (via your backend webhook, or by reading the store directly):
 
 ```js
-window.onRevenueCatPurchase = async () => {
-  const { restoredData } = await despia('getpurchasehistory://', ['restoredData']);
-  if (restoredData.some(p => p.isActive && p.entitlementId === 'premium')) unlockPremium();
-};
+despia.revenuecat.on('purchase', async () => {
+  const history = await despia.revenuecat.history();
+  if (history.some(p => p.isActive && p.entitlementId === 'premium')) unlockPremium();
+});
 ```
+
+Events need a current app build. Older builds report the purchase through `window.onRevenueCatPurchase()` instead.
 
 In the browser, fall back to a RevenueCat Web Purchase Link.
 
@@ -220,13 +299,13 @@ Encrypted key-value storage backed by iCloud KV (iOS) and Android App Backup. Va
 
 ```js
 // Write
-await despia('setvault://?key=sessionToken&value=abc123&locked=true');
+await despia.vault.set({ key: 'sessionToken', value: 'abc123', locked: true });
 
 // Read (prompts biometric if locked)
-const { sessionToken } = await despia('readvault://?key=sessionToken', ['sessionToken']);
+const sessionToken = await despia.vault.get({ key: 'sessionToken' });
 ```
 
-`readvault://` throws if the key doesn't exist. Wrap in try/catch.
+`vault.get` rejects if the key doesn't exist. Wrap in try/catch.
 
 [Docs](https://setup.despia.com/native-features/storage-vault)
 
@@ -272,9 +351,9 @@ iOS today, Android soon. Enable in **Despia > App > Settings > Integrations > Ap
 
 ```js
 // Attribution available on every launch
-despia.appsFlyerAttribution
-despia.appsFlyerReferrer
-despia.appsFlyerUID
+despia.legacy.variable('appsFlyerAttribution')
+despia.legacy.variable('appsFlyerReferrer')
+despia.legacy.variable('appsFlyerUID')
 
 // After login
 despia('appsflyer://set_user_id?customer_user_id=' + encodeURIComponent(userId));
@@ -291,17 +370,18 @@ despia('appsflyer://log_event?event_name=af_purchase&event_values=' + encodeURIC
 ### GPS Location
 
 ```js
-window.onLocationChange = (data) => {
-  if (data.active) console.log(data.latitude, data.longitude);
-};
+const off = despia.gps.on('change', (point) => {
+  if (point.active) console.log(point.latitude, point.longitude);
+});
 
 // buffer in seconds, movement threshold in centimetres
-despia('location://?buffer=60&movement=100');
+await despia.gps.start({ buffer: 60, movement: 100 });
 
-const { locationSession } = await despia('stoplocation://', ['locationSession']);
+const session = await despia.gps.stop();
+off();
 ```
 
-Add `&server=https://api.example.com/track` to POST each point as it's recorded.
+Add `server: 'https://api.example.com/track'` to POST each point as it's recorded. The `change` event needs a current app build; older builds call `window.onLocationChange` instead.
 
 [Docs](https://setup.despia.com/native-features/gps-location)
 
@@ -432,11 +512,11 @@ The app runs on a real origin, so `localStorage`, `IndexedDB`, and Web Crypto wo
 ### Haptic Feedback
 
 ```js
-despia('lighthaptic://');   // Subtle
-despia('heavyhaptic://');   // Strong
-despia('successhaptic://'); // Success
-despia('warninghaptic://'); // Warning
-despia('errorhaptic://');   // Error
+despia.haptics.light();   // Subtle
+despia.haptics.heavy();   // Strong
+despia.haptics.success(); // Success
+despia.haptics.warning(); // Warning
+despia.haptics.error();   // Error
 ```
 
 [Docs](https://setup.despia.com/native-features/haptic-feedback)
@@ -463,9 +543,11 @@ despia('reset://');
 ### App Information and Device Data
 
 ```js
-const { versionNumber, bundleNumber } = await despia('getappversion://', ['versionNumber', 'bundleNumber']);
-const { uuid }             = await despia('get-uuid://',              ['uuid']);
-const { storeLocation }    = await despia('getstorelocation://',      ['storeLocation']);
+const { versionNumber, bundleNumber } = await despia.device.appVersion();
+const uuid          = await despia.device.uuid();
+const storeLocation = await despia.device.storeLocation();
+
+// Not in the typed map yet:
 const { trackingDisabled } = await despia('user-disable-tracking://', ['trackingDisabled']);
 ```
 
@@ -579,17 +661,29 @@ For web builders (Lovable, Bolt, v0), paste: `https://setup.despia.com/mcp`.
 
 ## How It Works
 
-The SDK is a thin wrapper over a setter-based protocol bridge. Calling `despia()` assigns the scheme string to `window.despia`, which the native layer intercepts:
+Each typed call becomes one JSON message:
 
 ```js
 // When you call:
-despia('lighthaptic://');
+await despia.vault.get({ key: 'sessionToken' });
 
-// the SDK does:
-window.despia = 'lighthaptic://';
+// the SDK sends:
+{ v: 1, id: '…', feature: 'vault', action: 'get', args: { key: 'sessionToken' } }
+
+// and native answers with one of:
+{ id: '…', ok: true, value: 'abc123' }
+{ id: '…', ok: false, error: { code: 'not_found', message: '…' } }
 ```
 
-iOS intercepts the assignment in `WebViewController.swift`; Android intercepts it in `MainActivity.java`. Results come back as named window variables, which the SDK resolves as a promise via the optional `watch` array. For long-running work (downloads, purchases, biometric prompts), the native layer calls back via global functions like `window.onRevenueCatPurchase` or `window.contentServerChange` instead.
+On iOS the message goes through a `WKScriptMessageHandlerWithReply` handler; on Android through a web message listener, with the reply matched by `id`. Events come back as `{ feature, event, data }`. Because the payload is real JSON, there is no URL encoding and no length limit.
+
+The SDK picks the channel on every call:
+
+1. **JSON bridge** when the app provides it.
+2. **Protocol URL** inside older app builds: the call is translated to the feature's original scheme (for example `vault.get` becomes `readvault://?key=sessionToken`) and the result is read from the window variable the app writes back.
+3. **`not_in_app`** rejection in a plain browser.
+
+The original `despia('scheme://…', ['variable'])` call is still supported and behaves exactly as before.
 
 No dependencies, no initialization, no lifecycle to manage.
 
