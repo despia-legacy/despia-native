@@ -32,6 +32,33 @@ function buildCommand(legacy, args) {
   return command;
 }
 
+// Names that exist on window when the SDK loads: the browser's own, from the
+// window object and its prototype chain.
+const BUILTIN = (() => {
+  const names = new Set();
+  if (typeof window === 'undefined' || window === null) return names;
+  try {
+    for (let o = window; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      Object.getOwnPropertyNames(o).forEach((n) => names.add(n));
+    }
+  } catch (e) { /* keep what was read */ }
+  return names;
+})();
+
+function freeToClear(name) {
+  if (typeof window === 'undefined' || window === null) return true;
+  try {
+    if (BUILTIN.has(name)) return false;
+    if (!(name in window)) return true;
+    const d = Object.getOwnPropertyDescriptor(window, name);
+    if (!d || !d.configurable || !d.writable || !('value' in d)) return false;
+    const type = typeof d.value;
+    return d.value === undefined || (d.value !== null && type !== 'object' && type !== 'function');
+  } catch (e) {
+    return false;
+  }
+}
+
 // The window variables to watch, with names filled in from args. Every name
 // must be one the legacy channel may delete and wait on; an arg that would
 // turn into a browser global is refused before anything is sent.
@@ -45,13 +72,11 @@ function watchList(feature, action, legacy, args) {
       arg ? 'args.' + arg : undefined
     );
     if (!jsNameOK(name)) throw refuse('cannot be used as a window variable name');
-    // A name built from an argument must not point at an object or function
-    // the page or the app already put there: the watch deletes it first.
-    if (arg !== undefined && name !== template) {
-      let held;
-      try { held = typeof window !== 'undefined' ? typeof window[name] : 'undefined'; } catch (e) { held = 'object'; }
-      if (held === 'function' || held === 'object') throw refuse('is already in use on this page');
-    }
+    // A name built from an argument is deleted before the app answers, so it
+    // may only be one that is free, or one an earlier answer left as a plain
+    // value. Browser properties, getters and anything holding an object or
+    // function are refused.
+    if (arg !== undefined && name !== template && !freeToClear(name)) throw refuse('is already in use on this page');
     return name;
   });
 }
