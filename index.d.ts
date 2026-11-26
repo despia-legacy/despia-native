@@ -87,7 +87,18 @@ export type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 export interface JobDone {
   jobId: string;
   ok: boolean;
+  /** `success`, `cancelled`, `navigated`, a status the feature declares, or `failed`. Filled in when the app sent none. */
+  status?: string;
   error?: BridgeError;
+  [key: string]: unknown;
+}
+
+/**
+ * How a call or a job ended when it did not fail: a `status` and the
+ * feature's payload. A user cancel is a status, never a rejection.
+ */
+export interface Outcome {
+  status: string;
   [key: string]: unknown;
 }
 
@@ -204,15 +215,27 @@ export interface ListenOptions {
   jobId?: string;
 }
 
+/**
+ * `job.result`: the outcome of the job. It is a function and a thenable at
+ * once, so `await job.result` and `await job.result()` are the same call.
+ * Resolves for `success`, `cancelled`, `navigated` and any status the feature
+ * declares; rejects with DespiaError only when the job failed.
+ */
+export interface JobResult<O = Outcome> extends PromiseLike<O> {
+  (): Promise<O>;
+  catch<R = never>(onrejected?: ((reason: any) => R | PromiseLike<R>) | null): Promise<O | R>;
+  finally(onfinally?: (() => void) | null): Promise<O>;
+}
+
 /** The handle of one running job. */
-export interface Job<Done extends JobDone = JobDone> {
+export interface Job<Done extends JobDone = JobDone, Out = Outcome> {
   readonly id: string;
   readonly feature: FeatureId;
   readonly action: ActionName;
-  /** Listen to one event of this job (`error` is a `done` with `ok: false`). */
+  /** Listen to one event of this job (`error` fires only when the job failed; `done` carries the status). */
   on(event: string, fn: (data: any) => void, opts?: { since?: number | 'all' }): DespiaOff;
-  /** Resolves with the terminal event when it succeeds, rejects with DespiaError when not. */
-  result(): Promise<Done>;
+  /** The job's outcome, `{ status, ...payload }`. */
+  readonly result: JobResult<Out>;
   cancel(): Promise<{ cancelled: boolean; state: JobState }>;
   /** Tells the app it may drop stored events up to `seq`. */
   ack(seq: number): Promise<void>;
@@ -221,6 +244,7 @@ export interface Job<Done extends JobDone = JobDone> {
 /** Callbacks of any job: one function per event name, plus `done` and `error`. */
 export type Callbacks = { [event: string]: (data: any) => void } & {
   done?: (d: JobDone) => void;
+  /** Only for a job that failed; a cancel arrives in `done` with `status: 'cancelled'`. */
   error?: (e: BridgeError & { jobId: string }) => void;
 };
 
@@ -239,13 +263,13 @@ type NoArgs = undefined | Record<string, never>;
 
 /** The function type of one action, derived from its declaration. */
 export type DespiaAction<S> =
-  S extends { kind: 'job'; args: infer A; result: infer D; events: infer E }
-    ? D extends JobDone
+  S extends { kind: 'job'; args: infer A; result: infer D; outcome: infer O; events: infer E }
+    ? [D] extends [JobDone]
       ? [A] extends [void]
-        ? (args?: NoArgs, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D>>
+        ? (args?: NoArgs, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D, O>>
         : IsOptional<A> extends true
-          ? (args?: A, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D>>
-          : (args: A, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D>>
+          ? (args?: A, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D, O>>
+          : (args: A, callbacks?: JobCallbacks<E, D>, opts?: CallOptions) => Promise<Job<D, O>>
       : never
     : S extends { kind: 'request'; args: infer A; result: infer R }
       ? [A] extends [void]
@@ -282,7 +306,7 @@ export type DespiaActionName<F extends DespiaFeatureName> = keyof DespiaFeatureM
 export type DespiaArgs<F extends DespiaFeatureName, A extends DespiaActionName<F>> =
   DespiaFeatureMap[F]['actions'][A] extends { args: infer X } ? X : never;
 
-/** Resolved value of one request action, or the terminal event of a job action. */
+/** Resolved value of one request action (an outcome for an action that declares `returns`), or the terminal event of a job action. */
 export type DespiaResult<F extends DespiaFeatureName, A extends DespiaActionName<F>> =
   DespiaFeatureMap[F]['actions'][A] extends { result: infer X } ? X : never;
 
@@ -418,7 +442,10 @@ interface DespiaFunction extends DespiaFeatures {
   [key: string]: any;
 
   /**
-   * Listen to every event packet the page receives (broadcast).
+   * Hears every event packet of every feature (debugging, logging, chat-style
+   * streams). It is not how a feature delivers a result: a call resolves with
+   * its outcome, a job through `job.result`, and a repeating thing through
+   * `despia.<feature>.on(event, fn)`.
    * @returns An off function.
    *
    * @example

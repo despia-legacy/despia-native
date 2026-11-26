@@ -35,8 +35,8 @@ const HELLO = {
   v: 1,
   platform: 'ios',
   features: {
-    media: { version: '1.0.0', actions: ['pick', 'embedded_hide'], events: [] },
-    ffmpeg: { version: '1.0.0', actions: ['run'], events: ['progress', 'log', 'done'] },
+    media: { version: '1.0.0', actions: ['pick', 'embedded_hide', 'capture', 'scan'], events: [] },
+    ffmpeg: { version: '1.0.0', actions: ['run', 'transcode'], events: ['progress', 'log', 'done'] },
     notes: { version: '1.0.0', actions: ['get', 'search', 'set_expiry'], events: [] }
   },
   limits: { maxMessageBytes: 4194304, maxInFlight: 64 }

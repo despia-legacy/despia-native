@@ -64,7 +64,7 @@ test('generator: a job action and its events', () => {
   assert.deepStrictEqual(runtime.ffmpeg.events, ['progress', 'log', 'done']);
   assert.match(dts, /kind: 'job';/);
   assert.match(dts, /result: JobDone & \{/);
-  assert.match(dts, /import type \{ FileRef, JobDone \} from '\.\/index';/);
+  assert.match(dts, /import type \{ FileRef, Outcome, JobDone \} from '\.\/index';/);
 });
 
 test('generator: legacy arg names and encodings come from the catalog', () => {

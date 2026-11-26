@@ -156,6 +156,17 @@ Full API context: [`llms.txt`](https://setup.despia.com/llms.txt).
 
 Calls a native action with a plain JSON object and returns a `Promise` of its result. It rejects with a `DespiaError` (`code`, `message`, and `path` when the app names the offending argument).
 
+An action that ends once with a user-facing outcome (a sign-in, a picker, a purchase, a scan) resolves with `{ status, ...payload }`. A user who backs out is a status (`cancelled`), never a rejection; only a real failure rejects. When the app answers with plain data and no `status`, the SDK adds the action's default status (`success` unless the feature names another). The statuses an action can end with are typed per action.
+
+```ts
+// illustrative: any action whose feature declares `returns`
+const result = await despia.auth.signIn({ provider: 'google' });
+if (result.status === 'success') save(result.token);
+else if (result.status === 'cancelled') showLogin();   // not an exception
+```
+
+On an app without the JSON bridge, the same action resolves with the legacy answer as the payload and the default status. A legacy answer is reported as `cancelled` only where the catalog's mapping says which answer (`legacy.cancelWhen`: an error code of the answer envelope, or an exact answer value) means a cancel.
+
 ```ts
 const token: string = await despia.vault.get({ key: 'sessionToken' });
 const { versionNumber, bundleNumber } = await despia.device.appVersion();
@@ -168,7 +179,7 @@ Argument types, limits and bounds are checked by the app, which answers `bad_arg
 
 ### Long-running actions: jobs
 
-An action that runs for a while answers at once with a `Job`. Pass callbacks for the events you want; `done` fires last, and `error` is a shortcut for a `done` that did not succeed.
+An action that runs for a while answers at once with a `Job`. Pass callbacks for the events you want; `done` fires last and carries the job's `status`, and `error` fires only when the job failed (a cancel is not a failure).
 
 ```ts
 const job = await despia.ffmpeg.run({ input: file }, {
@@ -177,7 +188,8 @@ const job = await despia.ffmpeg.run({ input: file }, {
   error: ({ code, message }) => console.error(code, message)
 });
 
-const done = await job.result();   // resolves on success, rejects with DespiaError otherwise
+const outcome = await job.result;  // { status, ...payload }; `await job.result()` is the same
+if (outcome.status === 'cancelled') { /* resolved, not rejected */ }
 await job.cancel();                // { cancelled, state }
 ```
 
@@ -185,7 +197,7 @@ await job.cancel();                // { cancelled, state }
 | ------------------------------- | -------------------------------------------------------------------------- |
 | `job.id`                        | The job id                                                                 |
 | `job.on(event, fn, { since })`  | Another listener for this job; returns `off()`                             |
-| `job.result()`                  | Resolves with the `done` event when it succeeded                           |
+| `job.result`                    | The outcome `{ status, ...payload }`. Resolves for `success`, `cancelled`, `navigated` and any status the feature declares; rejects with `DespiaError` only when the job failed. A function and a thenable at once: `await job.result` and `await job.result()` are the same |
 | `job.cancel()`                  | Asks the app to cancel                                                     |
 | `job.ack(seq)`                  | Tells the app it may forget stored events up to `seq`                      |
 
@@ -213,7 +225,7 @@ Replayed events reach only listeners that passed `since`, and each of them gets 
 
 ### `despia.on(listener)`
 
-Hears every event packet the page receives (broadcast): `{ feature, event, data, jobId?, seq?, replay? }`. Returns an `off()` function.
+Hears every event packet the page receives: `{ feature, event, data, jobId?, seq?, replay? }`. Returns an `off()` function. It is for debugging, logging and chat-style streams; it is not how a feature delivers anything. Results come from the call's promise and `job.result`, repeating things from `despia.<feature>.on(event, fn)`. No feature needs `despia.on` to work.
 
 ```ts
 const off = despia.on((packet) => console.log(packet.feature, packet.event, packet.data));

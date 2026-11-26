@@ -42,6 +42,40 @@ function raceAbort(promise, signal, where) {
   });
 }
 
+// An outcome action answers { status, ...payload }. A handler that returns
+// plain data has the action's default status added.
+function toOutcome(value, fallback) {
+  if (isPlainObject(value)) {
+    if (typeof value.status === 'string' && value.status !== '') return value;
+    const out = { status: fallback };
+    Object.keys(value).forEach((key) => { if (key !== 'status') out[key] = value[key]; });
+    return out;
+  }
+  if (value === undefined || value === null) return { status: fallback };
+  return { status: fallback, value };
+}
+
+function sameJSON(a, b) {
+  try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return false; }
+}
+
+// The legacy answer of an outcome action. The catalog's `cancelWhen` names the
+// answer that means "the user cancelled": an error code of the answer
+// envelope, or an exact answer value.
+function legacyOutcome(promise, spec) {
+  const fallback = spec.returns.default;
+  const cancelWhen = spec.legacy.cancelWhen;
+  return promise.then((value) => {
+    if (cancelWhen && 'equals' in cancelWhen && sameJSON(value, cancelWhen.equals)) return { status: 'cancelled' };
+    return toOutcome(value, fallback);
+  }, (err) => {
+    if (cancelWhen && typeof cancelWhen.code === 'string' && err instanceof DespiaError && err.code === cancelWhen.code) {
+      return { status: 'cancelled' };
+    }
+    throw err;
+  });
+}
+
 function badArgs(where, message) {
   return Promise.reject(new DespiaError(ErrorCodes.BAD_ARGS, where + ': ' + message));
 }
@@ -90,11 +124,13 @@ function createApi({ catalog, bridge, hub, despiaFunction, observeVariable }) {
       if (listed(state.hello, feature, action)) {
         return isJob
           ? startJob(state, feature, action, spec, args, callbacks, signal)
-          : bridge.request(state, feature, action, args, spec.timeoutMs, signal);
+          : bridge.request(state, feature, action, args, spec.timeoutMs, signal).then((value) =>
+            (spec.returns ? toOutcome(value, spec.returns.default) : value));
       }
       if (!isJob && spec.legacy) {
         if (signal && signal.aborted) throw new DespiaError(ErrorCodes.ABORTED, where + ' was aborted');
-        return raceAbort(legacyCall(despiaFunction, feature, action, spec.legacy, args), signal, where);
+        const called = legacyCall(despiaFunction, feature, action, spec.legacy, args);
+        return raceAbort(spec.returns ? legacyOutcome(called, spec) : called, signal, where);
       }
       throw new DespiaError(
         ErrorCodes.FEATURE_NOT_INSTALLED,

@@ -49,8 +49,12 @@ const RESERVED_FEATURES = new Set([
   'bridge', 'legacy', 'jobs', 'on', 'off', 'ready', 'version', 'call',
   'then', 'apply', 'bind', 'length', 'name', 'prototype', 'arguments', 'caller', 'constructor'
 ]);
-const RESERVED_ACTIONS = new Set(['on', 'then', 'constructor', 'toString', 'valueOf', 'hasOwnProperty',
-  'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString', 'toJSON']);
+// Words an action may not be called, in either spelling: the SDK's own
+// per-feature words and the words every JavaScript object already has.
+const RESERVED_ACTIONS = new Set(['on', 'off', 'once', 'then', 'catch', 'finally', 'constructor', 'prototype',
+  'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString', 'toJSON']);
+const STATUS_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+const FAILURE_STATUSES = new Set(['failed', 'error']);
 const FEATURE_ID = /^[a-z][a-z0-9]*(_[a-z0-9]+)*$/;
 const ACTION_NAME = /^[a-z][a-z0-9_]{0,31}$/;
 const ARG_NAME = /^[a-z][a-zA-Z0-9_]{0,63}$/;
@@ -123,6 +127,41 @@ function checkLegacy(legacy, where) {
   if (legacy.answer !== 'none' && !names.length) fail(where, 'legacy.answer "' + legacy.answer + '" needs legacy.variable');
 }
 
+// `returns`: the statuses an action can end with, each with its payload.
+function checkReturns(action, here) {
+  const returns = action.returns;
+  if (action.result) fail(here, '"returns" and "result" are mutually exclusive');
+  if (!returns || typeof returns !== 'object' || !returns.statuses || typeof returns.statuses !== 'object') {
+    fail(here, 'returns needs a "statuses" object');
+  }
+  const names = Object.keys(returns.statuses);
+  if (!names.length) fail(here, 'returns.statuses must declare at least one status');
+  names.forEach((status) => {
+    if (!STATUS_NAME.test(status)) fail(here, 'invalid status name "' + status + '"');
+    if (FAILURE_STATUSES.has(status)) {
+      fail(here, '"' + status + '" cannot be a declared status: a real failure rejects the call');
+    }
+    const spec = returns.statuses[status] || {};
+    if (spec.data !== undefined) {
+      if (!spec.data || spec.data.type !== 'object') fail(here, 'status "' + status + '" data must be an object schema');
+      if (spec.data.properties && Object.prototype.hasOwnProperty.call(spec.data.properties, 'status')) {
+        fail(here, 'status "' + status + '" data must not declare its own "status"');
+      }
+      checkSchema(spec.data, here + ' status ' + status, SCHEMA_KINDS);
+    }
+  });
+  if (returns.default !== undefined && !Object.prototype.hasOwnProperty.call(returns.statuses, returns.default)) {
+    fail(here, 'returns.default "' + returns.default + '" is not a declared status');
+  }
+  if (returns.default === undefined && !Object.prototype.hasOwnProperty.call(returns.statuses, 'success')) {
+    fail(here, 'returns declares no "success" status: name returns.default');
+  }
+}
+
+function defaultStatus(returns) {
+  return returns.default !== undefined ? returns.default : 'success';
+}
+
 function checkFeature(id, feature, file) {
   const where = (file ? file + ': ' : '') + id;
   if (!FEATURE_ID.test(id) || id.length < 2 || id.length > 32) fail(where, 'invalid feature id');
@@ -152,6 +191,7 @@ function checkFeature(id, feature, file) {
       checkSchema(args[arg], here + '.' + arg, ARG_KINDS);
     });
     if (action.result) checkSchema(action.result, here + ' result', SCHEMA_KINDS);
+    if (action.returns !== undefined) checkReturns(action, here);
     if (action.timeoutMs !== undefined &&
         !(Number.isInteger(action.timeoutMs) && action.timeoutMs >= 100 && action.timeoutMs <= 600000)) {
       fail(here, 'timeoutMs must be an integer from 100 to 600000');
@@ -168,6 +208,17 @@ function checkFeature(id, feature, file) {
           }
         });
       });
+    }
+    if (action.legacy && action.legacy.cancelWhen !== undefined) {
+      const cancelWhen = action.legacy.cancelWhen;
+      const known = cancelWhen && typeof cancelWhen === 'object' && !Array.isArray(cancelWhen);
+      if (!known || (typeof cancelWhen.code !== 'string' && !('equals' in cancelWhen))) {
+        fail(here, 'legacy.cancelWhen needs a "code" string or an "equals" value');
+      }
+      if (!action.returns || !Object.prototype.hasOwnProperty.call(action.returns.statuses, 'cancelled')) {
+        fail(here, 'legacy.cancelWhen needs returns to declare a "cancelled" status');
+      }
+      if (action.kind === 'job') fail(here, 'legacy.cancelWhen applies to request actions');
     }
     if (action.kind === 'job') {
       [].concat((action.job && action.job.events) || []).forEach((event) => {
@@ -277,11 +328,29 @@ function jobEvents(action) {
   return Array.isArray(listed) && listed.length ? listed : ['progress', 'log', 'done'];
 }
 
+// { status: 'x', ...payload } for each declared status, as one union.
+function outcomeType(returns, pad) {
+  return Object.keys(returns.statuses).map((status) => {
+    const data = returns.statuses[status] || {};
+    const props = Object.assign({ status: { type: 'enum', values: [status], required: true } },
+      data.data && data.data.properties);
+    return objectType(props, pad, !!(data.data && data.data.additionalProperties === true));
+  }).join(' | ');
+}
+
 function doneType(action, events, pad) {
+  if (action.returns) return 'JobDone & (' + outcomeType(action.returns, pad) + " | { status: 'failed' })";
   const declared = events.done && events.done.data;
   if (declared) return 'JobDone & ' + withJobId(declared, pad);
   if (action.result) return 'JobDone & ' + tsType(action.result, pad);
   return 'JobDone';
+}
+
+// What `await job.result` resolves with: the status and the payload.
+function jobOutcomeType(action, events, pad) {
+  if (action.returns) return outcomeType(action.returns, pad);
+  const declared = (events.done && events.done.data) || action.result;
+  return declared && declared.type === 'object' ? 'Outcome & ' + tsType(Object.assign({}, declared, { nullable: false }), pad) : 'Outcome';
 }
 
 function actionType(action, events, pad) {
@@ -291,6 +360,7 @@ function actionType(action, events, pad) {
   out += inner + 'args: ' + argsType(action.args, inner) + ';\n';
   if (action.kind === 'job') {
     out += inner + 'result: ' + doneType(action, events, inner) + ';\n';
+    out += inner + 'outcome: ' + jobOutcomeType(action, events, inner) + ';\n';
     out += inner + 'events: {\n';
     jobEvents(action).filter((e) => e !== 'done').forEach((event) => {
       const spec = events[event] || {};
@@ -298,7 +368,8 @@ function actionType(action, events, pad) {
     });
     out += inner + '};\n';
   } else {
-    out += inner + 'result: ' + (action.result ? tsType(action.result, inner) : 'void') + ';\n';
+    const result = action.returns ? outcomeType(action.returns, inner) : action.result ? tsType(action.result, inner) : 'void';
+    out += inner + 'result: ' + result + ';\n';
   }
   return out + pad + '}';
 }
@@ -364,6 +435,7 @@ function runtimeLegacy(action) {
   });
   if (legacy.variable) out.variable = legacy.variable;
   if (legacy.callback) out.callback = legacy.callback;
+  if (legacy.cancelWhen) out.cancelWhen = legacy.cancelWhen;
   out.answer = legacy.answer;
   return out;
 }
@@ -376,6 +448,7 @@ function runtimeFeature(feature) {
     if (camelCase(name) !== name) out.alias = camelCase(name);
     if (action.timeoutMs !== undefined) out.timeoutMs = action.timeoutMs;
     if (action.kind === 'job') out.events = jobEvents(action);
+    if (action.returns) out.returns = { default: defaultStatus(action.returns) };
     if (action.legacy) out.legacy = runtimeLegacy(action);
     actions[name] = out;
   });
@@ -405,12 +478,13 @@ function generate(sources) {
     });
   });
   usesFileRef = /\bFileRef\b/.test(types);
+  const usesOutcome = /\bOutcome\b/.test(types);
 
   const dts = [
     '// features.d.ts - typed feature map for the Despia JSON bridge.',
     '// Generated by scripts/generate-features.js from bridge-catalog.json. Do not edit.',
     '',
-    "import type { " + (usesFileRef ? 'FileRef, ' : '') + "JobDone } from './index';",
+    "import type { " + (usesFileRef ? 'FileRef, ' : '') + (usesOutcome ? 'Outcome, ' : '') + "JobDone } from './index';",
     '',
     'export interface DespiaFeatureMap {',
     types.replace(/\n$/, ''),

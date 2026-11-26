@@ -242,7 +242,7 @@ test('despia.bridge.* reaches the built-in actions', async () => {
   const sent = nativeCalls(env).map((c) => c.action);
   assert.deepStrictEqual(sent, ['status', 'assets', 'jobs', 'job', 'subscribe', 'unsubscribe', 'cancel', 'ack']);
   assert.deepStrictEqual(nativeCalls(env)[7].args, { jobId: 'j-1', seq: 3 });
-  assert.deepStrictEqual(plain(await b.hello()).features.ffmpeg.actions, ['run']);
+  assert.deepStrictEqual(plain(await b.hello()).features.ffmpeg.actions, ['run', 'transcode']);
 });
 
 test('despia.bridge.*: native refusals surface unchanged; no bridge rejects', async () => {

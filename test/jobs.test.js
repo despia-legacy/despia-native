@@ -65,10 +65,11 @@ test('job: result() resolves with the terminal event when it succeeds', async ()
   const result = outcome(job.result());
   env.emit(ev('done', 1, { ok: true, outputs: [{ url: 'u', name: 'o.mp4', type: 'video/mp4', size: 3 }] }));
   await result.done;
-  assert.equal(result.value.ok, true);
+  assert.equal(result.value.status, 'success');
   assert.equal(result.value.outputs[0].name, 'o.mp4');
+  assert.equal('jobId' in result.value || 'ok' in result.value, false, 'the outcome is status and payload only');
   // Asking again after the end gives the same answer.
-  assert.equal((await job.result()).jobId, 'j-1');
+  assert.equal((await job.result()).status, 'success');
 });
 
 test('job: result() rejects with DespiaError when done.ok is false; error callback is sugar for it', async () => {
@@ -149,7 +150,7 @@ test('early events: packets that beat the start reply are held and delivered in 
   reply(ok({ jobId: 'j-1' }));
   const job = await started;
   assert.deepStrictEqual(seen, ['p10', 'p50', 'done']);
-  assert.equal((await job.result()).ok, true);
+  assert.equal((await job.result()).status, 'success');
 });
 
 test('early events: a job of another document is delivered once the start settles, not lost', async () => {
@@ -391,7 +392,7 @@ test('replay: a done replayed after a reload settles result()', async () => {
   const result = outcome(job.result());
   env.emit(ev('done', 9, { ok: true }, { replay: true }));
   await result.done;
-  assert.equal(result.value.ok, true);
+  assert.equal(result.value.status, 'success');
 });
 
 // ---- cancel and ack ---------------------------------------------------------
@@ -402,7 +403,7 @@ test('cancel: sends bridge.cancel for the job and returns its answer', async () 
   assert.deepStrictEqual(plain(await job.cancel()), { cancelled: true, state: 'cancelled' });
   assert.deepStrictEqual(sent(env, 'cancel').map((c) => c.args), [{ jobId: 'j-1' }]);
   env.emit(ev('done', 1, { ok: false, error: { code: 'cancelled', message: 'cancelled' } }));
-  await assert.rejects(job.result(), { code: 'cancelled' });
+  assert.deepStrictEqual(plain(await job.result()), { status: 'cancelled' });
 });
 
 test('cancel: an unknown job rejects with not_found', async () => {

@@ -31,7 +31,7 @@ function compile(source) {
 
 test('types: job actions, callbacks, Job handle and file refs', () => {
   const diagnostics = compile(`
-    import despia, { FileRef, Job, JobDone } from './index';
+    import despia, { FileRef, Job, JobDone, Outcome } from './index';
     type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
     function assertType<T extends true>(): void {}
 
@@ -44,7 +44,9 @@ test('types: job actions, callbacks, Job handle and file refs', () => {
       });
       const id: string = job.id;
       const done = await job.result();
+      const st: string = done.status;
       const first: FileRef | undefined = done.outputs?.[0];
+      void st;
       const cancelled = await job.cancel();
       const state: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' = cancelled.state;
       await job.ack(3);
@@ -97,7 +99,7 @@ test('types: job actions, callbacks, Job handle and file refs', () => {
       despia.ffmpeg.on('finished', () => {});
     }
 
-    assertType<Equal<ReturnType<typeof despia.ffmpeg.run>, Promise<Job<JobDone & { jobId: string; outputs?: FileRef[] }>>>>();
+    assertType<Equal<ReturnType<typeof despia.ffmpeg.run>, Promise<Job<JobDone & { jobId: string; outputs?: FileRef[] }, Outcome & { outputs?: FileRef[] }>>>>();
   `);
   assert.deepEqual(diagnostics, []);
 });
@@ -129,4 +131,48 @@ test('types: the native object, Hello and statuses carry the 1.1 fields and no i
     void bad; void worse;
   `);
   assert.deepEqual(diagnostics, []);
+});
+
+test('types: outcome actions resolve a union of statuses; job.result is an awaitable outcome', () => {
+  const diagnostics = compile(`
+    import despia, { FileRef } from './index';
+    type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+    function assertType<T extends true>(): void {}
+
+    export async function outcomes(input: FileRef): Promise<void> {
+      const shot = await despia.media.capture({ camera: 'back' });
+      if (shot.status === 'success') {
+        const file: FileRef = shot.file;
+        void file;
+      } else {
+        const only: 'cancelled' = shot.status;
+        void only;
+      }
+      const scan = await despia.media.scan();
+      const kind: 'scanned' | 'cancelled' = scan.status;
+      void kind;
+      // @ts-expect-error: failed is not a declared status
+      const bad: typeof shot.status = 'failed';
+      void bad;
+
+      const job = await despia.ffmpeg.transcode({ input }, {
+        done: (d) => { const s: 'success' | 'cancelled' | 'navigated' | 'failed' = d.status; void s; },
+        error: (e) => void e.code
+      });
+      const viaProperty = await job.result;
+      const viaCall = await job.result();
+      assertType<Equal<typeof viaProperty, typeof viaCall>>();
+      if (viaProperty.status === 'success') {
+        const out: FileRef = viaProperty.output;
+        void out;
+      }
+      // @ts-expect-error: failed rejects, it is not an outcome status
+      const nope: typeof viaProperty.status = 'failed';
+      void nope;
+      const plain = await despia.ffmpeg.run({ input });
+      const status: string = (await plain.result).status;
+      void status;
+    }
+  `);
+  assert.deepStrictEqual(diagnostics, []);
 });

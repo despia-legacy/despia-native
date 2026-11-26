@@ -20,6 +20,31 @@ function errorFrom(done) {
   );
 }
 
+// The status of a terminal packet. A v1 handler sends none: ok means
+// success, a cancel or navigation error code names itself, anything else failed.
+function statusOf(done) {
+  if (done && typeof done.status === 'string' && done.status !== '') return done.status;
+  if (done && done.ok === true) return 'success';
+  const err = done && done.error && typeof done.error === 'object' ? done.error : {};
+  return err.code === 'cancelled' || err.code === 'navigated' ? err.code : 'failed';
+}
+
+// The terminal packet with its status filled in.
+function withStatus(done) {
+  if (done && typeof done.status === 'string' && done.status !== '') return done;
+  return Object.assign({}, done, { status: statusOf(done) });
+}
+
+// What the job resolves with: { status, ...payload }, without the packet's
+// own bookkeeping.
+function outcomeOf(done) {
+  const out = { status: statusOf(done) };
+  Object.keys(done || {}).forEach((key) => {
+    if (key !== 'jobId' && key !== 'ok' && key !== 'error' && key !== 'status') out[key] = done[key];
+  });
+  return out;
+}
+
 function createJob({ hub, bridge, feature, action, id, callbacks }) {
   let finished = null;
   const waiters = [];
@@ -47,11 +72,12 @@ function createJob({ hub, bridge, feature, action, id, callbacks }) {
       // Sugar: `error` is a `done` that did not succeed.
       name = 'done';
       handler = (done) => {
-        if (done && done.ok === true) return;
+        if (statusOf(done) !== 'failed') return;
         const err = done && done.error && typeof done.error === 'object' ? done.error : {};
         fn(Object.assign({ code: ErrorCodes.INTERNAL, message: 'Job failed' }, err, { jobId: id }));
       };
     }
+    if (event === 'done') handler = (done) => fn(withStatus(done));
     if (opts.since !== undefined) {
       checkSince(opts.since);
       bridge.replay(feature, name, { [id]: opts.since === 'all' ? 0 : opts.since });
@@ -59,13 +85,23 @@ function createJob({ hub, bridge, feature, action, id, callbacks }) {
     return hub.on(feature, name, handler, { jobId: id, since: opts.since });
   }
 
-  function result() {
-    return new Promise((resolve, reject) => {
-      const settle = (done) => (done && done.ok === true ? resolve(done) : reject(errorFrom(done)));
-      if (finished) settle(finished);
-      else waiters.push(settle);
-    });
+  // `await job.result` and `await job.result()` both work: result is a
+  // function that is also a thenable, and both share one promise.
+  let settled = null;
+  function outcome() {
+    if (!settled) {
+      settled = new Promise((resolve, reject) => {
+        const settle = (done) => (statusOf(done) === 'failed' ? reject(errorFrom(done)) : resolve(outcomeOf(done)));
+        if (finished) settle(finished);
+        else waiters.push(settle);
+      });
+    }
+    return settled;
   }
+  const result = function result() { return outcome(); };
+  result.then = (onOk, onErr) => outcome().then(onOk, onErr);
+  result.catch = (onErr) => outcome().catch(onErr);
+  result.finally = (onDone) => outcome().finally(onDone);
 
   function cancel() {
     return bridge.builtin('cancel', { jobId: id });
