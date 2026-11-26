@@ -1,23 +1,24 @@
 'use strict';
 
-// Error type for every rejection of the new `despia.<feature>.<action>()` API.
-// Native error codes pass through unchanged; the SDK adds the codes below.
+// Error type for every rejection of the typed `despia.<feature>.<action>()`
+// API. Codes that native sends pass through unchanged; the codes below are
+// the ones the SDK itself produces.
 
 const ErrorCodes = Object.freeze({
-  NOT_IN_APP: 'not_in_app',     // plain browser: no JSON bridge and no Despia runtime
-  UNSUPPORTED: 'unsupported',   // no JSON bridge and the action has no legacy scheme
-  INVALID_ARGS: 'invalid_args', // args failed validation or are not JSON-serialisable
-  TIMEOUT: 'timeout',           // legacy fallback: the result variable never arrived
-  BRIDGE_ERROR: 'bridge_error', // transport failure or malformed reply
-  NATIVE_ERROR: 'native_error'  // native rejected without a structured error
+  NOT_IN_APP: 'not_in_app',                       // plain browser: no Despia runtime at all
+  ABORTED: 'aborted',                             // the caller's AbortSignal fired
+  TIMEOUT: 'timeout',                             // no reply inside timeoutMs + 5000
+  FEATURE_NOT_INSTALLED: 'feature_not_installed', // this app build has no bridge route for it
+  BAD_ARGS: 'bad_args',                           // args were not a plain object
+  INTERNAL: 'internal'                            // malformed reply or transport fault
 });
 
 class DespiaError extends Error {
-  constructor(code, message, details) {
+  constructor(code, message, path) {
     super(message || String(code));
     this.name = 'DespiaError';
     this.code = String(code);
-    if (details !== undefined) this.details = details;
+    if (path !== undefined) this.path = path;
   }
 }
 

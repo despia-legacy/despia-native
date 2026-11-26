@@ -196,4 +196,4 @@
       return observeVariables(watch);
     }
 
-module.exports = { despiaFunction };
+module.exports = { despiaFunction, observeDespiaVariable };

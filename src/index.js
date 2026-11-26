@@ -1,23 +1,26 @@
 'use strict';
 
-const { despiaFunction } = require('./legacy');
+const { despiaFunction, observeDespiaVariable } = require('./legacy');
 const { DespiaError } = require('./errors');
 const { createEventHub } = require('./events');
-const { createTransport } = require('./transport');
+const { createBridge } = require('./bridge');
 const { createApi } = require('./api');
-const features = require('./features');
+const catalog = require('./features');
+
+const LIMITS = Object.freeze({
+  maxMessageBytes: 4194304,
+  maxDepth: 32,
+  maxNodes: 100000,
+  maxKeyLength: 128,
+  maxInFlight: 64,
+  maxPerSecond: 200,
+  newStringMaxBytes: 262144
+});
 
 const hub = createEventHub();
-const transport = createTransport();
-transport.install(hub.dispatch);
-
-const api = createApi({ features, transport, hub, despiaFunction });
-
-const legacy = Object.freeze({
-  // Reads a variable the app injected the old way (window[name]).
-  variable(name) {
-    return typeof window !== 'undefined' ? window[name] : undefined;
-  }
+const bridge = createBridge(hub);
+const api = createApi({
+  catalog, bridge, hub, despiaFunction, observeVariable: observeDespiaVariable
 });
 
 // New members are non-enumerable so the function object looks as it did.
@@ -27,12 +30,12 @@ function define(name, value) {
   });
 }
 
-Object.keys(api.namespaces).forEach((name) => define(name, api.namespaces[name]));
-define('on', function on(listener) {
-  return hub.onAny(listener);
-});
-define('legacy', legacy);
+// Resolution order for despia.<x>: the SDK's own words, then a catalog
+// feature, then (in the proxy below) the old window pass-through.
+Object.keys(api.words).forEach((name) => define(name, api.words[name]));
+Object.keys(api.features).forEach((name) => define(name, api.features[name]));
 define('DespiaError', DespiaError);
+define('LIMITS', LIMITS);
 
     // Create proxy for window access
     const despia = new Proxy(despiaFunction, {
