@@ -1,0 +1,23 @@
+{
+  "feature": "vault",
+  "description": "Encrypted key-value storage that survives reinstall.",
+  "actions": {
+    "set": {
+      "scheme": "setvault://",
+      "params": {
+        "key": { "type": "string", "required": true, "min": 1 },
+        "value": { "type": "string", "required": true },
+        "locked": { "type": "boolean", "description": "Require biometrics to read it back." }
+      }
+    },
+    "get": {
+      "scheme": "readvault://",
+      "params": {
+        "key": { "type": "string", "required": true, "min": 1 }
+      },
+      "callback": ["{key}"],
+      "returns": "{key}",
+      "result": { "type": "string" }
+    }
+  }
+}

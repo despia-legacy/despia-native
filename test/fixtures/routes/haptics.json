@@ -1,0 +1,11 @@
+{
+  "feature": "haptics",
+  "actions": {
+    "light": { "scheme": "lighthaptic://" },
+    "heavy": { "scheme": "heavyhaptic://" },
+    "success": { "scheme": "successhaptic://" },
+    "warning": { "scheme": "warninghaptic://" },
+    "error": { "scheme": "errorhaptic://" }
+  },
+  "events": []
+}

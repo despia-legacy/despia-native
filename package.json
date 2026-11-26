@@ -1,6 +1,6 @@
 {
     "name": "despia-native",
-    "version": "1.0.28",
+    "version": "1.1.0",
     "description": "Web-native iOS and Android SDK. Biometrics, GPS, in-app purchases, push notifications, and 50+ native APIs - no Swift, no Kotlin.",
     "main": "index.js",
     "module": "index.js",
@@ -34,12 +34,18 @@
     "author": "Despia Native <developers@despia.com>",
     "license": "MIT",
     "scripts": {
-        "test": "echo \"No tests specified\"",
+        "build": "node scripts/build.js",
+        "generate": "node scripts/generate-features.js",
+        "test": "node scripts/build.js --check && node --test \"test/*.test.js\" && tsc -p test/types",
         "prepublishOnly": "npm test"
     },
     "files": [
         "index.js",
         "index.d.ts",
+        "features.d.ts",
         "README.md"
-    ]
+    ],
+    "devDependencies": {
+        "typescript": "^5.9.3"
+    }
 }
