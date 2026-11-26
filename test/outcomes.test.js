@@ -229,3 +229,39 @@ test('generator: outcome types are a union per declared status', () => {
   assert.match(dts, /status: "success";\s+file: FileRef;/);
   assert.match(dts, /status: "cancelled";/);
 });
+
+test('job outcome: a done with status "error" is a failure and keeps its error', async () => {
+  const env = bridgeApp(() => undefined);
+  const dones = [];
+  const errors = [];
+  const job = await env.despia.ffmpeg.transcode({ input: INPUT }, {
+    done: (d) => dones.push(d.status),
+    error: (e) => errors.push(e.code)
+  });
+  env.emit(ev('done', 1, { ok: false, status: 'error', error: { code: 'handler_error', message: 'bad codec' } }));
+  await assert.rejects(job.result(), { code: 'handler_error', message: 'bad codec' });
+  assert.deepStrictEqual(dones, ['failed']);
+  assert.deepStrictEqual(errors, ['handler_error']);
+});
+
+test('outcome: a reply whose status is failed or error rejects with its error', async () => {
+  for (const status of ['failed', 'error']) {
+    const env = bridgeApp((call) => (call.action === 'capture'
+      ? ok({ status, error: { code: 'unavailable', message: 'no camera' } }) : undefined));
+    await assert.rejects(env.despia.media.capture(), { code: 'unavailable', message: 'no camera' }, status);
+  }
+});
+
+test('generator: unknown keys in returns and in a status entry are refused', () => {
+  const run = (returns) => () => generate(catalog({ go: { kind: 'request', args: {}, returns } }));
+  assert.throws(run({ statuses: statuses(), defualt: 'success' }), /unknown key "defualt"/);
+  assert.throws(run({ statuses: statuses({ cancelled: { descripton: 'x' } }) }), /status "cancelled" has an unknown key "descripton"/);
+  run({ statuses: statuses({ cancelled: { description: 'x' } }), default: 'success' })();
+});
+
+test('generator: job types always include cancelled and navigated, without a payload', () => {
+  const { dts } = generate(catalog({
+    go: { kind: 'job', args: {}, returns: { statuses: { success: { data: { type: 'object', properties: { out: { type: 'string', required: true } } } } } } }
+  }));
+  assert.match(dts, /outcome: \{\s+status: "success";\s+out: string;\s+\} \| \{\s+status: "cancelled";\s+\} \| \{\s+status: "navigated";/);
+});

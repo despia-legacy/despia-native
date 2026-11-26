@@ -23,7 +23,8 @@ function errorFrom(done) {
 // The status of a terminal packet. A v1 handler sends none: ok means
 // success, a cancel or navigation error code names itself, anything else failed.
 function statusOf(done) {
-  if (done && typeof done.status === 'string' && done.status !== '') return done.status;
+  // `error` is reserved for failures, so it reads as one.
+  if (done && typeof done.status === 'string' && done.status !== '') return done.status === 'error' ? 'failed' : done.status;
   if (done && done.ok === true) return 'success';
   const err = done && done.error && typeof done.error === 'object' ? done.error : {};
   return err.code === 'cancelled' || err.code === 'navigated' ? err.code : 'failed';
@@ -31,7 +32,7 @@ function statusOf(done) {
 
 // The terminal packet with its status filled in.
 function withStatus(done) {
-  if (done && typeof done.status === 'string' && done.status !== '') return done;
+  if (done && typeof done.status === 'string' && done.status !== '' && done.status !== 'error') return done;
   return Object.assign({}, done, { status: statusOf(done) });
 }
 

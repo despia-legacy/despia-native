@@ -45,7 +45,7 @@ test('types: job actions, callbacks, Job handle and file refs', () => {
       const id: string = job.id;
       const done = await job.result();
       const st: string = done.status;
-      const first: FileRef | undefined = done.outputs?.[0];
+      const first: FileRef | undefined = done.status === 'success' ? done.outputs?.[0] : undefined;
       void st;
       const cancelled = await job.cancel();
       const state: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' = cancelled.state;
@@ -99,7 +99,10 @@ test('types: job actions, callbacks, Job handle and file refs', () => {
       despia.ffmpeg.on('finished', () => {});
     }
 
-    assertType<Equal<ReturnType<typeof despia.ffmpeg.run>, Promise<Job<JobDone & { jobId: string; outputs?: FileRef[] }, Outcome & { outputs?: FileRef[] }>>>>();
+    type RunJob = Awaited<ReturnType<typeof despia.ffmpeg.run>>;
+    type RunOutcome = Awaited<ReturnType<RunJob['result']>>;
+    assertType<Equal<RunOutcome, { status: "success"; outputs?: FileRef[] } | { status: "cancelled" } | { status: "navigated" }>>();
+    assertType<Equal<ReturnType<typeof despia.ffmpeg.run>, Promise<Job<JobDone & { jobId: string; outputs?: FileRef[] }, RunOutcome>>>>();
   `);
   assert.deepEqual(diagnostics, []);
 });
@@ -172,6 +175,42 @@ test('types: outcome actions resolve a union of statuses; job.result is an await
       const plain = await despia.ffmpeg.run({ input });
       const status: string = (await plain.result).status;
       void status;
+    }
+  `);
+  assert.deepStrictEqual(diagnostics, []);
+});
+
+test('types: a job outcome can always be cancelled or navigated; payload needs narrowing', () => {
+  const diagnostics = compile(`
+    import despia, { FileRef } from './index';
+
+    export async function narrowed(input: FileRef): Promise<void> {
+      const job = await despia.ffmpeg.thumbnail({ input });
+      const outcome = await job.result;
+      if (outcome.status === 'success') {
+        const out: FileRef = outcome.output;
+        void out;
+      }
+      const stop: typeof outcome.status = 'cancelled';
+      const moved: typeof outcome.status = 'navigated';
+      void stop; void moved;
+      // @ts-expect-error: failed rejects, it is not an outcome status
+      const bad: typeof outcome.status = 'failed';
+      void bad;
+      // @ts-expect-error: a cancelled outcome has no output, so it is not readable before narrowing
+      const { output } = outcome;
+      void output;
+
+      // A job whose handler declares no statuses: the same two outcomes.
+      const plain = await (await despia.ffmpeg.run({ input })).result;
+      const other: typeof plain.status = 'cancelled';
+      void other;
+      if (plain.status === 'success') {
+        const files: FileRef[] | undefined = plain.outputs;
+        void files;
+      }
+      // @ts-expect-error: not readable before narrowing
+      void plain.outputs;
     }
   `);
   assert.deepStrictEqual(diagnostics, []);

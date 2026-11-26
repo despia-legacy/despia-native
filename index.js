@@ -68,6 +68,12 @@
     // plain data has the action's default status added.
     function toOutcome(value, fallback) {
       if (isPlainObject(value)) {
+        if (value.status === 'failed' || value.status === 'error') {
+          // A failure is a rejection, never an outcome.
+          const err = isPlainObject(value.error) ? value.error : {};
+          throw new DespiaError(typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
+            typeof err.message === 'string' ? err.message : 'Native call failed');
+        }
         if (typeof value.status === 'string' && value.status !== '') return value;
         const out = { status: fallback };
         Object.keys(value).forEach((key) => { if (key !== 'status') out[key] = value[key]; });
@@ -1069,7 +1075,8 @@
     // The status of a terminal packet. A v1 handler sends none: ok means
     // success, a cancel or navigation error code names itself, anything else failed.
     function statusOf(done) {
-      if (done && typeof done.status === 'string' && done.status !== '') return done.status;
+      // `error` is reserved for failures, so it reads as one.
+      if (done && typeof done.status === 'string' && done.status !== '') return done.status === 'error' ? 'failed' : done.status;
       if (done && done.ok === true) return 'success';
       const err = done && done.error && typeof done.error === 'object' ? done.error : {};
       return err.code === 'cancelled' || err.code === 'navigated' ? err.code : 'failed';
@@ -1077,7 +1084,7 @@
 
     // The terminal packet with its status filled in.
     function withStatus(done) {
-      if (done && typeof done.status === 'string' && done.status !== '') return done;
+      if (done && typeof done.status === 'string' && done.status !== '' && done.status !== 'error') return done;
       return Object.assign({}, done, { status: statusOf(done) });
     }
 

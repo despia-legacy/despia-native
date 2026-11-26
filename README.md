@@ -165,7 +165,7 @@ if (result.status === 'success') save(result.token);
 else if (result.status === 'cancelled') showLogin();   // not an exception
 ```
 
-On an app without the JSON bridge, the same action resolves with the legacy answer as the payload and the default status. A legacy answer is reported as `cancelled` only where the catalog's mapping says which answer (`legacy.cancelWhen`: an error code of the answer envelope, or an exact answer value) means a cancel.
+On an app without the JSON bridge, the same action resolves with the legacy answer as the payload and the default status.
 
 ```ts
 const token: string = await despia.vault.get({ key: 'sessionToken' });

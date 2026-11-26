@@ -46,6 +46,12 @@ function raceAbort(promise, signal, where) {
 // plain data has the action's default status added.
 function toOutcome(value, fallback) {
   if (isPlainObject(value)) {
+    if (value.status === 'failed' || value.status === 'error') {
+      // A failure is a rejection, never an outcome.
+      const err = isPlainObject(value.error) ? value.error : {};
+      throw new DespiaError(typeof err.code === 'string' && err.code ? err.code : ErrorCodes.INTERNAL,
+        typeof err.message === 'string' ? err.message : 'Native call failed');
+    }
     if (typeof value.status === 'string' && value.status !== '') return value;
     const out = { status: fallback };
     Object.keys(value).forEach((key) => { if (key !== 'status') out[key] = value[key]; });

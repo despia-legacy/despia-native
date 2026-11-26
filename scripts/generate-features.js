@@ -134,6 +134,9 @@ function checkReturns(action, here) {
   if (!returns || typeof returns !== 'object' || !returns.statuses || typeof returns.statuses !== 'object') {
     fail(here, 'returns needs a "statuses" object');
   }
+  Object.keys(returns).forEach((key) => {
+    if (key !== 'statuses' && key !== 'default') fail(here, 'returns has an unknown key "' + key + '"');
+  });
   const names = Object.keys(returns.statuses);
   if (!names.length) fail(here, 'returns.statuses must declare at least one status');
   names.forEach((status) => {
@@ -142,6 +145,9 @@ function checkReturns(action, here) {
       fail(here, '"' + status + '" cannot be a declared status: a real failure rejects the call');
     }
     const spec = returns.statuses[status] || {};
+    Object.keys(spec).forEach((key) => {
+      if (key !== 'data' && key !== 'description') fail(here, 'status "' + status + '" has an unknown key "' + key + '"');
+    });
     if (spec.data !== undefined) {
       if (!spec.data || spec.data.type !== 'object') fail(here, 'status "' + status + '" data must be an object schema');
       if (spec.data.properties && Object.prototype.hasOwnProperty.call(spec.data.properties, 'status')) {
@@ -332,14 +338,24 @@ function jobEvents(action) {
 function outcomeType(returns, pad) {
   return Object.keys(returns.statuses).map((status) => {
     const data = returns.statuses[status] || {};
-    const props = Object.assign({ status: { type: 'enum', values: [status], required: true } },
-      data.data && data.data.properties);
+    const marker = { type: 'enum', values: [status], required: true };
+    const props = Object.assign({ status: marker }, data.data && data.data.properties, { status: marker });
     return objectType(props, pad, !!(data.data && data.data.additionalProperties === true));
   }).join(' | ');
 }
 
+// A job can always end cancelled or navigated, whatever it declares, and
+// those two carry no payload.
+function withJobEnds(returns) {
+  const statuses = Object.assign({}, returns.statuses);
+  ['cancelled', 'navigated'].forEach((status) => {
+    if (!Object.prototype.hasOwnProperty.call(statuses, status)) statuses[status] = {};
+  });
+  return { statuses };
+}
+
 function doneType(action, events, pad) {
-  if (action.returns) return 'JobDone & (' + outcomeType(action.returns, pad) + " | { status: 'failed' })";
+  if (action.returns) return 'JobDone & (' + outcomeType(withJobEnds(action.returns), pad) + " | { status: 'failed' })";
   const declared = events.done && events.done.data;
   if (declared) return 'JobDone & ' + withJobId(declared, pad);
   if (action.result) return 'JobDone & ' + tsType(action.result, pad);
@@ -348,9 +364,10 @@ function doneType(action, events, pad) {
 
 // What `await job.result` resolves with: the status and the payload.
 function jobOutcomeType(action, events, pad) {
-  if (action.returns) return outcomeType(action.returns, pad);
+  if (action.returns) return outcomeType(withJobEnds(action.returns), pad);
   const declared = (events.done && events.done.data) || action.result;
-  return declared && declared.type === 'object' ? 'Outcome & ' + tsType(Object.assign({}, declared, { nullable: false }), pad) : 'Outcome';
+  if (!declared || declared.type !== 'object') return 'Outcome';
+  return outcomeType(withJobEnds({ statuses: { success: { data: declared } } }), pad);
 }
 
 function actionType(action, events, pad) {

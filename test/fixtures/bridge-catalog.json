@@ -307,6 +307,39 @@
             "scope": "document",
             "durable": true
           }
+        },
+        "thumbnail": {
+          "kind": "job",
+          "description": "Declares only success: cancelled and navigated still end it.",
+          "args": {
+            "input": {
+              "type": "fileRef",
+              "required": true
+            }
+          },
+          "returns": {
+            "statuses": {
+              "success": {
+                "data": {
+                  "type": "object",
+                  "properties": {
+                    "output": {
+                      "type": "fileRef",
+                      "required": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "job": {
+            "events": [
+              "progress",
+              "done"
+            ],
+            "scope": "document",
+            "durable": true
+          }
         }
       },
       "events": {
